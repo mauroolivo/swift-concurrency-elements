@@ -1,7 +1,8 @@
 import SwiftUI
 
 struct ContentView: View {
-    @State private var model = Stage0LabModel()
+    @State private var stage0Model = Stage0LabModel()
+    @State private var stage1Model = Stage1LabModel()
 
     var body: some View {
         NavigationStack {
@@ -14,20 +15,54 @@ struct ContentView: View {
                         .font(.system(.body, design: .monospaced))
 
                     Button("Run Stage 0 Experiment") {
-                        model.runExperiment()
+                        stage0Model.runExperiment()
                     }
                     .buttonStyle(.borderedProminent)
                 }
 
-                Section("Log") {
-                    if model.events.isEmpty {
+                Section("Stage 0 Log") {
+                    if stage0Model.events.isEmpty {
                         ContentUnavailableView(
                             "No events yet",
                             systemImage: "play.circle",
                             description: Text("Run the experiment, then inspect the order of events in Xcode's console and here in the app.")
                         )
                     } else {
-                        ForEach(model.events) { event in
+                        ForEach(stage0Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                Section("Stage 1 — async/await Execution") {
+                    Text("Sequential async calls")
+                        .font(.headline)
+
+                    Text("fetchUser() must finish before fetchPosts(for:) starts.")
+
+                    Button(stage1Model.isRunning ? "Running…" : "Run Sequential Experiment") {
+                        stage1Model.runSequentialExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage1Model.isRunning)
+                }
+
+                Section("Stage 1 Log") {
+                    if stage1Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "clock",
+                            description: Text("Run the sequential experiment and compare the timestamps with the console output.")
+                        )
+                    } else {
+                        ForEach(stage1Model.events) { event in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(event.message)
                                     .font(.body)
@@ -49,6 +84,16 @@ private struct LabEvent: Identifiable {
     let id = UUID()
     let message: String
     let context: String
+}
+
+private struct CourseUser {
+    let id: Int
+    let name: String
+}
+
+private struct CoursePost: Identifiable {
+    let id: Int
+    let title: String
 }
 
 @MainActor
@@ -78,6 +123,66 @@ private final class Stage0LabModel {
 
         events.append(event)
         print("[Stage 0] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage1LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    func runSequentialExperiment() {
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            let start = Date()
+
+            do {
+                record("Sequential experiment started")
+
+                let user = try await fetchUser()
+                let posts = try await fetchPosts(for: user)
+
+                let elapsed = Date().timeIntervalSince(start)
+                record("Finished: \(user.name), \(posts.count) posts, elapsed: \(elapsed.formatted(.number.precision(.fractionLength(2))))s")
+            } catch {
+                record("Failed with error: \(error)")
+            }
+
+            isRunning = false
+        }
+    }
+
+    private func fetchUser() async throws -> CourseUser {
+        record("fetchUser() entered — synchronous work before first await")
+
+        try await Task.sleep(for: .seconds(1))
+
+        record("fetchUser() resumed after suspension")
+        return CourseUser(id: 1, name: "Blob")
+    }
+
+    private func fetchPosts(for user: CourseUser) async throws -> [CoursePost] {
+        record("fetchPosts(for: \(user.name)) entered only after fetchUser() returned")
+
+        try await Task.sleep(for: .seconds(1))
+
+        record("fetchPosts(for:) resumed after suspension")
+        return [
+            CoursePost(id: 1, title: "Structured concurrency"),
+            CoursePost(id: 2, title: "Actor isolation")
+        ]
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 1] \(message) — \(context)")
     }
 }
 
