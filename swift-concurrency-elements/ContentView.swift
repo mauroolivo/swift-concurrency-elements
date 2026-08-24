@@ -45,12 +45,18 @@ struct ContentView: View {
                     Text("Sequential async calls")
                         .font(.headline)
 
-                    Text("fetchUser() must finish before fetchPosts(for:) starts.")
+                    Text("Compare sequential await with async let. Each simulated operation takes about one second.")
 
                     Button(stage1Model.isRunning ? "Running…" : "Run Sequential Experiment") {
                         stage1Model.runSequentialExperiment()
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(stage1Model.isRunning)
+
+                    Button(stage1Model.isRunning ? "Running…" : "Run async let Experiment") {
+                        stage1Model.runAsyncLetExperiment()
+                    }
+                    .buttonStyle(.bordered)
                     .disabled(stage1Model.isRunning)
                 }
 
@@ -143,10 +149,37 @@ private final class Stage1LabModel {
                 record("Sequential experiment started")
 
                 let user = try await fetchUser()
-                let posts = try await fetchPosts(for: user)
+                let posts = try await fetchPosts()
 
                 let elapsed = Date().timeIntervalSince(start)
                 record("Finished: \(user.name), \(posts.count) posts, elapsed: \(elapsed.formatted(.number.precision(.fractionLength(2))))s")
+            } catch {
+                record("Failed with error: \(error)")
+            }
+
+            isRunning = false
+        }
+    }
+
+    func runAsyncLetExperiment() {
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            let start = Date()
+
+            do {
+                record("async let experiment started")
+
+                async let user = fetchUser()
+                async let posts = fetchPosts()
+
+                record("Both async let child tasks have been declared")
+
+                let (loadedUser, loadedPosts) = try await (user, posts)
+
+                let elapsed = Date().timeIntervalSince(start)
+                record("Finished: \(loadedUser.name), \(loadedPosts.count) posts, elapsed: \(elapsed.formatted(.number.precision(.fractionLength(2))))s")
             } catch {
                 record("Failed with error: \(error)")
             }
@@ -164,12 +197,12 @@ private final class Stage1LabModel {
         return CourseUser(id: 1, name: "Blob")
     }
 
-    private func fetchPosts(for user: CourseUser) async throws -> [CoursePost] {
-        record("fetchPosts(for: \(user.name)) entered only after fetchUser() returned")
+    private func fetchPosts() async throws -> [CoursePost] {
+        record("fetchPosts() entered — synchronous work before first await")
 
         try await Task.sleep(for: .seconds(1))
 
-        record("fetchPosts(for:) resumed after suspension")
+        record("fetchPosts() resumed after suspension")
         return [
             CoursePost(id: 1, title: "Structured concurrency"),
             CoursePost(id: 2, title: "Actor isolation")
