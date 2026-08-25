@@ -5,6 +5,7 @@ struct ContentView: View {
     @State private var stage1Model = Stage1LabModel()
     @State private var stage2Model = Stage2LabModel()
     @State private var stage3Model = Stage3LabModel()
+    @State private var stage4Model = Stage4LabModel()
 
     var body: some View {
         NavigationStack {
@@ -168,6 +169,46 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 4 — Task Groups") {
+                    Text("Dynamic batch loading")
+                        .font(.headline)
+
+                    Text("Load a variable-size collection with withThrowingTaskGroup and watch results arrive in completion order.")
+
+                    Button(stage4Model.isRunning ? "Running…" : "Run Task Group Experiment") {
+                        stage4Model.runTaskGroupExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage4Model.isRunning)
+
+                    Button("Cancel Stage 4 Experiment") {
+                        stage4Model.cancelTaskGroupExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!stage4Model.isRunning)
+                }
+
+                Section("Stage 4 Log") {
+                    if stage4Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "square.stack.3d.down.right",
+                            description: Text("Run the task-group batch loader, then cancel it to observe cancellation propagation through the group.")
+                        )
+                    } else {
+                        ForEach(stage4Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -190,8 +231,26 @@ private struct CoursePost: Identifiable {
     let title: String
 }
 
+private struct Stage4LoadItem: Identifiable, Sendable {
+    let id = UUID()
+    let name: String
+    let delayMilliseconds: Int
+}
+
 private nonisolated enum Stage2Context {
     @TaskLocal static var traceID: String = "unassigned"
+}
+
+private func simulateStage4Load(_ item: Stage4LoadItem) async throws -> String {
+    print("[Stage 4] \(item.name) started — planned delay: \(item.delayMilliseconds)ms")
+
+    try Task.checkCancellation()
+    try await Task.sleep(for: .milliseconds(item.delayMilliseconds))
+    try Task.checkCancellation()
+
+    let result = "\(item.name) loaded after \(item.delayMilliseconds)ms"
+    print("[Stage 4] \(result)")
+    return result
 }
 
 @MainActor
@@ -530,6 +589,89 @@ private final class Stage3LabModel {
 
         events.append(event)
         print("[Stage 3] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage4LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private var experimentTask: Task<Void, Never>?
+
+    func runTaskGroupExperiment() {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        let items: [Stage4LoadItem] = [
+            Stage4LoadItem(name: "Avatar", delayMilliseconds: 900),
+            Stage4LoadItem(name: "Thumbnail", delayMilliseconds: 200),
+            Stage4LoadItem(name: "Hero", delayMilliseconds: 700),
+            Stage4LoadItem(name: "Badge", delayMilliseconds: 400),
+            Stage4LoadItem(name: "Backdrop", delayMilliseconds: 1000)
+        ]
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            let start = Date()
+
+            do {
+                record("Task group experiment started")
+                record("Input order: \(items.map(\.name).joined(separator: ", "))")
+
+                let completionOrder = try await loadAssets(items)
+                let elapsed = Date().timeIntervalSince(start)
+
+                record("Completion order: \(completionOrder.joined(separator: ", "))")
+                record("Finished: \(completionOrder.count) assets, elapsed: \(elapsed.formatted(.number.precision(.fractionLength(2))))s")
+            } catch is CancellationError {
+                record("Task group experiment cancelled")
+            } catch {
+                record("Failed with error: \(error)")
+            }
+        }
+    }
+
+    func cancelTaskGroupExperiment() {
+        guard let experimentTask else { return }
+
+        record("Cancel requested for Stage 4 task")
+        experimentTask.cancel()
+    }
+
+    private func loadAssets(_ items: [Stage4LoadItem]) async throws -> [String] {
+        try await withThrowingTaskGroup(of: String.self) { group in
+            for item in items {
+                group.addTask {
+                    try await simulateStage4Load(item)
+                }
+            }
+
+            var completionOrder: [String] = []
+
+            for try await result in group {
+                completionOrder.append(result)
+                record("Received completion: \(result)")
+            }
+
+            return completionOrder
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 4] \(message) — \(context)")
     }
 }
 
