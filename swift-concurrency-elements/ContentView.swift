@@ -290,8 +290,8 @@ private final class Stage2LabModel {
                 record("Parent task started")
                 record("Parent context — traceID: \(Stage2Context.traceID), priority: \(Task.currentPriority)")
 
-                let child = Task { [traceID = Stage2Context.traceID] in
-                    await childWork(label: "Task { } child", inheritedTraceID: traceID)
+                let child = Task {
+                    await childWork(label: "Task { } child", inheritedTraceID: Stage2Context.traceID)
                 }
 
                 let detached = Task.detached(priority: .background) {
