@@ -4,6 +4,7 @@ struct ContentView: View {
     @State private var stage0Model = Stage0LabModel()
     @State private var stage1Model = Stage1LabModel()
     @State private var stage2Model = Stage2LabModel()
+    @State private var stage3Model = Stage3LabModel()
 
     var body: some View {
         NavigationStack {
@@ -110,6 +111,52 @@ struct ContentView: View {
                         )
                     } else {
                         ForEach(stage2Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                Section("Stage 3 — Cancellation") {
+                    Text("Cooperative cancellation")
+                        .font(.headline)
+
+                    Text("Compare an operation that ignores cancellation with one that checks for it and runs cleanup via withTaskCancellationHandler.")
+
+                    Button(stage3Model.isRunning ? "Running…" : "Run Ignoring Cancellation Experiment") {
+                        stage3Model.runIgnoringCancellationExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage3Model.isRunning)
+
+                    Button(stage3Model.isRunning ? "Running…" : "Run Cooperative Cancellation Experiment") {
+                        stage3Model.runCooperativeCancellationExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage3Model.isRunning)
+
+                    Button("Cancel Stage 3 Experiment") {
+                        stage3Model.cancelExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!stage3Model.isRunning)
+                }
+
+                Section("Stage 3 Log") {
+                    if stage3Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "nosign",
+                            description: Text("Run one of the cancellation experiments, then cancel it and observe which work stops and which work keeps going.")
+                        )
+                    } else {
+                        ForEach(stage3Model.events) { event in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(event.message)
                                     .font(.body)
@@ -376,6 +423,113 @@ private final class Stage2LabModel {
 
         events.append(event)
         print("[Stage 2] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage3LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private var experimentTask: Task<Void, Never>?
+
+    func runIgnoringCancellationExperiment() {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            let start = Date()
+            record("Ignoring-cancellation experiment started")
+
+            let result = await loadImageWhileIgnoringCancellation()
+            let elapsed = Date().timeIntervalSince(start)
+
+            record("Finished: \(result), elapsed: \(elapsed.formatted(.number.precision(.fractionLength(2))))s")
+        }
+    }
+
+    func runCooperativeCancellationExperiment() {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            let start = Date()
+
+            do {
+                try await withTaskCancellationHandler(operation: {
+                    record("Cooperative cancellation experiment started")
+                    let image = try await loadImageCooperatively()
+                    let elapsed = Date().timeIntervalSince(start)
+                    record("Finished: \(image), elapsed: \(elapsed.formatted(.number.precision(.fractionLength(2))))s")
+                }, onCancel: {
+                    Task { @MainActor in
+                        self.record("Cancellation handler ran — cleaning up image load")
+                    }
+                })
+            } catch {
+                record("Failed with error: \(error)")
+            }
+        }
+    }
+
+    func cancelExperiment() {
+        guard let experimentTask else { return }
+
+        record("Cancel requested for Stage 3 task")
+        experimentTask.cancel()
+    }
+
+    private func loadImageWhileIgnoringCancellation() async -> String {
+        record("Ignoring version entered — cancellation will be observed but not respected")
+
+        for step in 1...4 {
+            do {
+                record("Ignoring version step \(step) started")
+                try await Task.sleep(for: .milliseconds(3000))
+                record("Ignoring version step \(step) completed")
+            } catch {
+                record("Ignoring version step \(step) was cancelled, but the error is intentionally ignored")
+            }
+        }
+
+        return "Avatar image loaded despite cancellation"
+    }
+
+    private func loadImageCooperatively() async throws -> String {
+        record("Cooperative version entered — cancellation will be checked explicitly")
+
+        for step in 1...4 {
+            try Task.checkCancellation()
+            record("Cooperative version step \(step) started")
+            try await Task.sleep(for: .milliseconds(1000))
+            record("Cooperative version step \(step) completed")
+        }
+
+        return "Avatar image loaded cooperatively"
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 3] \(message) — \(context)")
     }
 }
 
