@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @State private var stage0Model = Stage0LabModel()
     @State private var stage1Model = Stage1LabModel()
+    @State private var stage2Model = Stage2LabModel()
 
     var body: some View {
         NavigationStack {
@@ -80,6 +81,46 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 2 — Task Hierarchy") {
+                    Text("Task inheritance vs Task.detached")
+                        .font(.headline)
+
+                    Text("Watch task-local values, actor context, and cancellation behavior diverge.")
+
+                    Button(stage2Model.isRunning ? "Running…" : "Run Hierarchy Experiment") {
+                        stage2Model.runHierarchyExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage2Model.isRunning)
+
+                    Button("Cancel Hierarchy Experiment") {
+                        stage2Model.cancelHierarchyExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!stage2Model.isRunning)
+                }
+
+                Section("Stage 2 Log") {
+                    if stage2Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "square.stack.3d.up",
+                            description: Text("Run the hierarchy experiment, then optionally cancel it before the window closes.")
+                        )
+                    } else {
+                        ForEach(stage2Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -100,6 +141,10 @@ private struct CourseUser {
 private struct CoursePost: Identifiable {
     let id: Int
     let title: String
+}
+
+private nonisolated enum Stage2Context {
+    @TaskLocal static var traceID: String = "unassigned"
 }
 
 @MainActor
@@ -216,6 +261,121 @@ private final class Stage1LabModel {
 
         events.append(event)
         print("[Stage 1] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage2LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private var experimentTask: Task<Void, Never>?
+
+    func runHierarchyExperiment() {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        let traceID = UUID().uuidString.prefix(8)
+
+        experimentTask = Task(priority: .userInitiated) {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            await Stage2Context.$traceID.withValue(String(traceID)) {
+                record("Parent task started")
+                record("Parent context — traceID: \(Stage2Context.traceID), priority: \(Task.currentPriority)")
+
+                let child = Task { [traceID = Stage2Context.traceID] in
+                    await childWork(label: "Task { } child", inheritedTraceID: traceID)
+                }
+
+                let detached = Task.detached(priority: .background) {
+                    let detachedTraceID = Stage2Context.traceID
+                    let detachedPriority = Task.currentPriority
+
+                    print("[Stage 2] Task.detached started — traceID: \(detachedTraceID), priority: \(detachedPriority)")
+
+                    var outcome = "Task.detached summary — traceID: \(detachedTraceID), priority: \(detachedPriority)"
+
+                    do {
+                        for step in 1...4 {
+                            try Task.checkCancellation()
+                            print("[Stage 2] Task.detached step \(step) — traceID: \(Stage2Context.traceID)")
+                            try await Task.sleep(for: .milliseconds(250))
+                        }
+
+                        outcome += ", completed normally"
+                    } catch {
+                        outcome += ", cancelled: \(error)"
+                    }
+
+                    print("[Stage 2] \(outcome)")
+                    return outcome
+                }
+
+                record("Spawned child and detached tasks")
+
+                do {
+                    try await Task.sleep(for: .seconds(2))
+                    record("Parent sleep window completed")
+
+                    let childSummary = await child.value
+                    record("Child summary: \(childSummary)")
+
+                    let detachedSummary = await detached.value
+                    record("Detached summary: \(detachedSummary)")
+                } catch is CancellationError {
+                    record("Parent observed cancellation")
+                    let detachedSummary = await detached.value
+                    record("Detached summary after parent cancellation: \(detachedSummary)")
+                } catch {
+                    record("Parent failed with error: \(error)")
+                }
+
+                record("Parent task finished")
+            }
+        }
+    }
+
+    func cancelHierarchyExperiment() {
+        guard let experimentTask else { return }
+
+        record("Cancel requested for parent task")
+        experimentTask.cancel()
+    }
+
+    private func childWork(label: String, inheritedTraceID: String) async -> String {
+        record("\(label) started — traceID: \(inheritedTraceID), priority: \(Task.currentPriority)")
+
+        do {
+            for step in 1...4 {
+                try Task.checkCancellation()
+                record("\(label) step \(step) — traceID: \(Stage2Context.traceID)")
+                try await Task.sleep(for: .milliseconds(250))
+            }
+
+            let summary = "\(label) summary — traceID: \(Stage2Context.traceID), completed normally"
+            record(summary)
+            return summary
+        } catch {
+            let summary = "\(label) summary — traceID: \(Stage2Context.traceID), cancelled: \(error)"
+            record(summary)
+            return summary
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 2] \(message) — \(context)")
     }
 }
 
