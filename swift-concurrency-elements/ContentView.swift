@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var stage3Model = Stage3LabModel()
     @State private var stage4Model = Stage4LabModel()
     @State private var stage5Model = Stage5LabModel()
+    @State private var stage6Model = Stage6LabModel()
 
     var body: some View {
         NavigationStack {
@@ -244,6 +245,40 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 6 — Actor Reentrancy") {
+                    Text("Logical races across await")
+                        .font(.headline)
+
+                    Text("Run two withdrawals against one actor. Actor isolation prevents data races, but the intentionally flawed operation can still overdraw after suspension.")
+
+                    Button(stage6Model.isRunning ? "Running…" : "Run Reentrancy Experiment") {
+                        stage6Model.runReentrancyExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage6Model.isRunning)
+                }
+
+                Section("Stage 6 Log") {
+                    if stage6Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "arrow.trianglehead.2.clockwise.rotate.90",
+                            description: Text("Run the reentrancy experiment and predict whether both withdrawals can observe the same pre-await balance.")
+                        )
+                    } else {
+                        ForEach(stage6Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -277,6 +312,21 @@ private struct CachedImage: Identifiable, Sendable {
     let bytes: Int
 
     var id: URL { url }
+}
+
+private struct Stage6WithdrawalResult: Sendable {
+    let label: String
+    let approved: Bool
+    let observedBalanceBeforeAuthorization: Int
+    let balanceAfterMutation: Int
+
+    var summary: String {
+        if approved {
+            "Withdrawal \(label) approved — observed before await: \(observedBalanceBeforeAuthorization), balance after mutation: \(balanceAfterMutation)"
+        } else {
+            "Withdrawal \(label) denied — observed balance: \(observedBalanceBeforeAuthorization)"
+        }
+    }
 }
 
 private nonisolated enum Stage2Context {
@@ -315,6 +365,48 @@ private actor ImageCache {
     func count() -> Int {
         storage.count
     }
+}
+
+private actor BankAccount {
+    private var balance: Int
+
+    init(balance: Int) {
+        self.balance = balance
+    }
+
+    func currentBalance() -> Int {
+        balance
+    }
+
+    func withdraw(_ amount: Int, label: String) async -> Stage6WithdrawalResult {
+        let observedBalance = balance
+
+        guard balance >= amount else {
+            return Stage6WithdrawalResult(
+                label: label,
+                approved: false,
+                observedBalanceBeforeAuthorization: observedBalance,
+                balanceAfterMutation: balance
+            )
+        }
+
+        await authorizeStage6Withdrawal(label: label)
+
+        balance -= amount
+
+        return Stage6WithdrawalResult(
+            label: label,
+            approved: true,
+            observedBalanceBeforeAuthorization: observedBalance,
+            balanceAfterMutation: balance
+        )
+    }
+}
+
+private nonisolated func authorizeStage6Withdrawal(label: String) async {
+    print("[Stage 6] Authorization requested for withdrawal \(label)")
+    try? await Task.sleep(for: .milliseconds(500))
+    print("[Stage 6] Authorization completed for withdrawal \(label)")
 }
 
 @MainActor
@@ -803,6 +895,56 @@ private final class Stage5LabModel {
 
         events.append(event)
         print("[Stage 5] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage6LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    func runReentrancyExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let account = BankAccount(balance: 100)
+
+            record("Reentrancy experiment started with balance: 100")
+            record("Launching two 80-unit withdrawals with async let")
+
+            async let first = account.withdraw(80, label: "A")
+            async let second = account.withdraw(80, label: "B")
+
+            let (firstResult, secondResult) = await (first, second)
+            let finalBalance = await account.currentBalance()
+
+            record(firstResult.summary)
+            record(secondResult.summary)
+            record("Final balance: \(finalBalance)")
+
+            if finalBalance < 0 {
+                record("Bug exposed: actor isolation prevented a data race, but did not protect the check-then-mutate invariant across await")
+            } else {
+                record("No overdraft observed this run; run again and inspect where suspension allows reentrancy")
+            }
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 6] \(message) — \(context)")
     }
 }
 
