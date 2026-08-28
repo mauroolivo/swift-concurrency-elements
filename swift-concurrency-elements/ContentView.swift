@@ -252,10 +252,16 @@ struct ContentView: View {
 
                     Text("Run two withdrawals against one actor. Actor isolation prevents data races, but the intentionally flawed operation can still overdraw after suspension.")
 
-                    Button(stage6Model.isRunning ? "Running…" : "Run Reentrancy Experiment") {
+                    Button(stage6Model.isRunning ? "Running…" : "Run Broken Reentrancy Experiment") {
                         stage6Model.runReentrancyExperiment()
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(stage6Model.isRunning)
+
+                    Button(stage6Model.isRunning ? "Running…" : "Run Fixed Reentrancy Experiment") {
+                        stage6Model.runFixedReentrancyExperiment()
+                    }
+                    .buttonStyle(.bordered)
                     .disabled(stage6Model.isRunning)
                 }
 
@@ -317,14 +323,14 @@ private struct CachedImage: Identifiable, Sendable {
 private struct Stage6WithdrawalResult: Sendable {
     let label: String
     let approved: Bool
-    let observedBalanceBeforeAuthorization: Int
+    let balanceUsedForDecision: Int
     let balanceAfterMutation: Int
 
     var summary: String {
         if approved {
-            "Withdrawal \(label) approved — observed before await: \(observedBalanceBeforeAuthorization), balance after mutation: \(balanceAfterMutation)"
+            "Withdrawal \(label) approved — decision balance: \(balanceUsedForDecision), balance after mutation: \(balanceAfterMutation)"
         } else {
-            "Withdrawal \(label) denied — observed balance: \(observedBalanceBeforeAuthorization)"
+            "Withdrawal \(label) denied — decision balance: \(balanceUsedForDecision)"
         }
     }
 }
@@ -385,7 +391,7 @@ private actor BankAccount {
             return Stage6WithdrawalResult(
                 label: label,
                 approved: false,
-                observedBalanceBeforeAuthorization: observedBalance,
+                balanceUsedForDecision: observedBalance,
                 balanceAfterMutation: balance
             )
         }
@@ -397,7 +403,31 @@ private actor BankAccount {
         return Stage6WithdrawalResult(
             label: label,
             approved: true,
-            observedBalanceBeforeAuthorization: observedBalance,
+            balanceUsedForDecision: observedBalance,
+            balanceAfterMutation: balance
+        )
+    }
+
+    func withdrawAfterRevalidation(_ amount: Int, label: String) async -> Stage6WithdrawalResult {
+        await authorizeStage6Withdrawal(label: label)
+
+        let decisionBalance = balance
+
+        guard decisionBalance >= amount else {
+            return Stage6WithdrawalResult(
+                label: label,
+                approved: false,
+                balanceUsedForDecision: decisionBalance,
+                balanceAfterMutation: balance
+            )
+        }
+
+        balance -= amount
+
+        return Stage6WithdrawalResult(
+            label: label,
+            approved: true,
+            balanceUsedForDecision: decisionBalance,
             balanceAfterMutation: balance
         )
     }
@@ -934,6 +964,40 @@ private final class Stage6LabModel {
                 record("Bug exposed: actor isolation prevented a data race, but did not protect the check-then-mutate invariant across await")
             } else {
                 record("No overdraft observed this run; run again and inspect where suspension allows reentrancy")
+            }
+        }
+    }
+
+    func runFixedReentrancyExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let account = BankAccount(balance: 100)
+
+            record("Fixed reentrancy experiment started with balance: 100")
+            record("Launching two 80-unit withdrawals that revalidate after await")
+
+            async let first = account.withdrawAfterRevalidation(80, label: "A")
+            async let second = account.withdrawAfterRevalidation(80, label: "B")
+
+            let (firstResult, secondResult) = await (first, second)
+            let finalBalance = await account.currentBalance()
+
+            record(firstResult.summary)
+            record(secondResult.summary)
+            record("Final balance: \(finalBalance)")
+
+            if finalBalance >= 0 {
+                record("Fix confirmed: the balance decision was made after authorization, inside the actor, using current state")
+            } else {
+                record("Unexpected overdraft; inspect the fixed method because the invariant is still broken")
             }
         }
     }
