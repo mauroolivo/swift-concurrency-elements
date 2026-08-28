@@ -263,6 +263,12 @@ struct ContentView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(stage6Model.isRunning)
+
+                    Button(stage6Model.isRunning ? "Running…" : "Run Duplicate Image Request Experiment") {
+                        stage6Model.runDuplicateImageRequestExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage6Model.isRunning)
                 }
 
                 Section("Stage 6 Log") {
@@ -331,6 +337,21 @@ private struct Stage6WithdrawalResult: Sendable {
             "Withdrawal \(label) approved — decision balance: \(balanceUsedForDecision), balance after mutation: \(balanceAfterMutation)"
         } else {
             "Withdrawal \(label) denied — decision balance: \(balanceUsedForDecision)"
+        }
+    }
+}
+
+private struct Stage6ImageRequestResult: Sendable {
+    let label: String
+    let cacheHit: Bool
+    let downloadNumber: Int?
+    let image: CachedImage
+
+    var summary: String {
+        if cacheHit {
+            "Request \(label) returned cached image, bytes: \(image.bytes)"
+        } else {
+            "Request \(label) performed underlying download #\(downloadNumber ?? -1), bytes: \(image.bytes)"
         }
     }
 }
@@ -433,10 +454,49 @@ private actor BankAccount {
     }
 }
 
+private actor NaiveImagePipeline {
+    private var cache: [URL: CachedImage] = [:]
+    private var downloadCount = 0
+
+    func image(for url: URL, label: String) async -> Stage6ImageRequestResult {
+        if let cached = cache[url] {
+            return Stage6ImageRequestResult(
+                label: label,
+                cacheHit: true,
+                downloadNumber: nil,
+                image: cached
+            )
+        }
+
+        let image = await simulateStage6ImageDownload(from: url, label: label)
+
+        downloadCount += 1
+        cache[url] = image
+
+        return Stage6ImageRequestResult(
+            label: label,
+            cacheHit: false,
+            downloadNumber: downloadCount,
+            image: image
+        )
+    }
+
+    func totalUnderlyingDownloads() -> Int {
+        downloadCount
+    }
+}
+
 private nonisolated func authorizeStage6Withdrawal(label: String) async {
     print("[Stage 6] Authorization requested for withdrawal \(label)")
     try? await Task.sleep(for: .milliseconds(500))
     print("[Stage 6] Authorization completed for withdrawal \(label)")
+}
+
+private nonisolated func simulateStage6ImageDownload(from url: URL, label: String) async -> CachedImage {
+    print("[Stage 6] Request \(label) started underlying image download")
+    try? await Task.sleep(for: .milliseconds(500))
+    print("[Stage 6] Request \(label) completed underlying image download")
+    return CachedImage(url: url, bytes: 64_000)
 }
 
 @MainActor
@@ -998,6 +1058,41 @@ private final class Stage6LabModel {
                 record("Fix confirmed: the balance decision was made after authorization, inside the actor, using current state")
             } else {
                 record("Unexpected overdraft; inspect the fixed method because the invariant is still broken")
+            }
+        }
+    }
+
+    func runDuplicateImageRequestExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let pipeline = NaiveImagePipeline()
+            let url = URL(string: "https://example.com/images/hero.png")!
+
+            record("Duplicate image request experiment started")
+            record("Launching two requests for the same URL against a naive actor pipeline")
+
+            async let first = pipeline.image(for: url, label: "A")
+            async let second = pipeline.image(for: url, label: "B")
+
+            let (firstResult, secondResult) = await (first, second)
+            let totalDownloads = await pipeline.totalUnderlyingDownloads()
+
+            record(firstResult.summary)
+            record(secondResult.summary)
+            record("Total underlying downloads: \(totalDownloads)")
+
+            if totalDownloads > 1 {
+                record("Bug exposed: both requests observed a cache miss before either stored the downloaded image")
+            } else {
+                record("No duplicate observed this run; run again and inspect the cache-miss await window")
             }
         }
     }
