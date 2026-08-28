@@ -269,6 +269,12 @@ struct ContentView: View {
                     }
                     .buttonStyle(.bordered)
                     .disabled(stage6Model.isRunning)
+
+                    Button(stage6Model.isRunning ? "Running…" : "Run Deduplicated Image Request Experiment") {
+                        stage6Model.runDeduplicatedImageRequestExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage6Model.isRunning)
                 }
 
                 Section("Stage 6 Log") {
@@ -342,16 +348,24 @@ private struct Stage6WithdrawalResult: Sendable {
 }
 
 private struct Stage6ImageRequestResult: Sendable {
+    enum Source: Sendable {
+        case cacheHit
+        case newDownload(Int)
+        case sharedInProgress
+    }
+
     let label: String
-    let cacheHit: Bool
-    let downloadNumber: Int?
+    let source: Source
     let image: CachedImage
 
     var summary: String {
-        if cacheHit {
+        switch source {
+        case .cacheHit:
             "Request \(label) returned cached image, bytes: \(image.bytes)"
-        } else {
-            "Request \(label) performed underlying download #\(downloadNumber ?? -1), bytes: \(image.bytes)"
+        case .newDownload(let downloadNumber):
+            "Request \(label) performed underlying download #\(downloadNumber), bytes: \(image.bytes)"
+        case .sharedInProgress:
+            "Request \(label) shared existing in-progress download, bytes: \(image.bytes)"
         }
     }
 }
@@ -462,8 +476,7 @@ private actor NaiveImagePipeline {
         if let cached = cache[url] {
             return Stage6ImageRequestResult(
                 label: label,
-                cacheHit: true,
-                downloadNumber: nil,
+                source: .cacheHit,
                 image: cached
             )
         }
@@ -475,8 +488,59 @@ private actor NaiveImagePipeline {
 
         return Stage6ImageRequestResult(
             label: label,
-            cacheHit: false,
-            downloadNumber: downloadCount,
+            source: .newDownload(downloadCount),
+            image: image
+        )
+    }
+
+    func totalUnderlyingDownloads() -> Int {
+        downloadCount
+    }
+}
+
+private actor DeduplicatingImagePipeline {
+    private enum Entry {
+        case inProgress(Task<CachedImage, Never>)
+        case ready(CachedImage)
+    }
+
+    private var entries: [URL: Entry] = [:]
+    private var downloadCount = 0
+
+    func image(for url: URL, label: String) async -> Stage6ImageRequestResult {
+        if let entry = entries[url] {
+            switch entry {
+            case .ready(let image):
+                return Stage6ImageRequestResult(
+                    label: label,
+                    source: .cacheHit,
+                    image: image
+                )
+
+            case .inProgress(let task):
+                let image = await task.value
+                return Stage6ImageRequestResult(
+                    label: label,
+                    source: .sharedInProgress,
+                    image: image
+                )
+            }
+        }
+
+        let task = Task {
+            await simulateStage6ImageDownload(from: url, label: label)
+        }
+
+        entries[url] = .inProgress(task)
+
+        let image = await task.value
+
+        downloadCount += 1
+        entries[url] = .ready(image)
+
+        return Stage6ImageRequestResult(
+            label: label,
+            source: .newDownload(downloadCount),
             image: image
         )
     }
@@ -1093,6 +1157,41 @@ private final class Stage6LabModel {
                 record("Bug exposed: both requests observed a cache miss before either stored the downloaded image")
             } else {
                 record("No duplicate observed this run; run again and inspect the cache-miss await window")
+            }
+        }
+    }
+
+    func runDeduplicatedImageRequestExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let pipeline = DeduplicatingImagePipeline()
+            let url = URL(string: "https://example.com/images/hero.png")!
+
+            record("Deduplicated image request experiment started")
+            record("Launching two requests for the same URL against a pipeline that stores in-progress work")
+
+            async let first = pipeline.image(for: url, label: "A")
+            async let second = pipeline.image(for: url, label: "B")
+
+            let (firstResult, secondResult) = await (first, second)
+            let totalDownloads = await pipeline.totalUnderlyingDownloads()
+
+            record(firstResult.summary)
+            record(secondResult.summary)
+            record("Total underlying downloads: \(totalDownloads)")
+
+            if totalDownloads == 1 {
+                record("Fix confirmed: the second request reused the in-progress task instead of starting another download")
+            } else {
+                record("Unexpected duplicate; inspect where the in-progress entry is stored")
             }
         }
     }
