@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var stage2Model = Stage2LabModel()
     @State private var stage3Model = Stage3LabModel()
     @State private var stage4Model = Stage4LabModel()
+    @State private var stage5Model = Stage5LabModel()
 
     var body: some View {
         NavigationStack {
@@ -209,6 +210,40 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 5 — Actors and Isolation") {
+                    Text("Actor-isolated cache")
+                        .font(.headline)
+
+                    Text("Use an ImageCache actor to protect mutable cache state. Cross-actor reads and writes require await; nonisolated immutable metadata does not.")
+
+                    Button(stage5Model.isRunning ? "Running…" : "Run Actor Cache Experiment") {
+                        stage5Model.runActorCacheExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage5Model.isRunning)
+                }
+
+                Section("Stage 5 Log") {
+                    if stage5Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "shippingbox",
+                            description: Text("Run the actor cache experiment and watch which operations require await across the actor boundary.")
+                        )
+                    } else {
+                        ForEach(stage5Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -237,6 +272,13 @@ private struct Stage4LoadItem: Identifiable, Sendable {
     let delayMilliseconds: Int
 }
 
+private struct CachedImage: Identifiable, Sendable {
+    let url: URL
+    let bytes: Int
+
+    var id: URL { url }
+}
+
 private nonisolated enum Stage2Context {
     @TaskLocal static var traceID: String = "unassigned"
 }
@@ -251,6 +293,28 @@ private func simulateStage4Load(_ item: Stage4LoadItem) async throws -> String {
     let result = "\(item.name) loaded after \(item.delayMilliseconds)ms"
     print("[Stage 4] \(result)")
     return result
+}
+
+private actor ImageCache {
+    nonisolated let name = "Stage 5 ImageCache"
+
+    private var storage: [URL: CachedImage] = [:]
+
+    func image(for url: URL) -> CachedImage? {
+        storage[url]
+    }
+
+    func insert(_ image: CachedImage) {
+        storage[image.url] = image
+    }
+
+    func removeAll() {
+        storage.removeAll()
+    }
+
+    func count() -> Int {
+        storage.count
+    }
 }
 
 @MainActor
@@ -672,6 +736,73 @@ private final class Stage4LabModel {
 
         events.append(event)
         print("[Stage 4] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage5LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private let cache = ImageCache()
+    private let avatarURL = URL(string: "https://example.com/images/avatar.png")!
+
+    func runActorCacheExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            record("Actor cache experiment started")
+            record("Read nonisolated actor metadata without await: \(cache.name)")
+
+            await cache.removeAll()
+            record("Cleared cache through cross-actor call")
+
+            let firstLookup = await cache.image(for: avatarURL)
+            record("First lookup result: \(describe(firstLookup))")
+
+            let downloaded = try? await downloadAvatar(from: avatarURL)
+
+            if let downloaded {
+                await cache.insert(downloaded)
+                record("Inserted downloaded image through actor-isolated mutation")
+            }
+
+            let secondLookup = await cache.image(for: avatarURL)
+            let cacheCount = await cache.count()
+
+            record("Second lookup result: \(describe(secondLookup))")
+            record("Cache count after insert: \(cacheCount)")
+            record("Experiment finished — cache state was mutated only inside the ImageCache actor")
+        }
+    }
+
+    private func downloadAvatar(from url: URL) async throws -> CachedImage {
+        record("Simulated download started outside the cache actor")
+        try await Task.sleep(for: .milliseconds(700))
+        record("Simulated download completed; now we have a Sendable value to pass into the actor")
+        return CachedImage(url: url, bytes: 42_000)
+    }
+
+    private func describe(_ image: CachedImage?) -> String {
+        guard let image else { return "cache miss" }
+        return "cache hit, bytes: \(image.bytes)"
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 5] \(message) — \(context)")
     }
 }
 
