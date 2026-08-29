@@ -310,6 +310,12 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(stage7Model.isRunning)
+
+                    Button(stage7Model.isRunning ? "Running…" : "Run @unchecked Sendable Experiment") {
+                        stage7Model.runUncheckedSendableExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage7Model.isRunning)
                 }
 
                 Section("Stage 7 Log") {
@@ -420,6 +426,36 @@ private final class Stage7MutableImageBox {
 
     init(byteCount: Int) {
         self.byteCount = byteCount
+    }
+}
+
+private nonisolated final class Stage7ImmutableImageConfiguration: Sendable {
+    let preferredScale: Int
+    let format: String
+
+    init(preferredScale: Int, format: String) {
+        self.preferredScale = preferredScale
+        self.format = format
+    }
+}
+
+private nonisolated final class Stage7LockedImageCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+
+        value += 1
+        return value
+    }
+
+    func snapshot() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+
+        return value
     }
 }
 
@@ -1326,6 +1362,50 @@ private final class Stage7LabModel {
             record("Diagnostic example, not compiled here: an @Sendable closure that mutates a captured var counter would be rejected")
             record("Experiment finished — Sendable is about safe movement across isolation domains, not about background threads")
         }
+    }
+
+    func runUncheckedSendableExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let configuration = Stage7ImmutableImageConfiguration(
+                preferredScale: 3,
+                format: "HEIF"
+            )
+            let counter = Stage7LockedImageCounter()
+
+            record("@unchecked Sendable experiment started")
+            record("Immutable final class crossed safely: scale \(configuration.preferredScale)x, format: \(configuration.format)")
+            record("Locked counter uses @unchecked Sendable because the compiler cannot inspect the NSLock invariant")
+            record("Invariant: every read and write of counter.value must happen while holding the same lock")
+
+            async let first: String = incrementCounter(counter, label: "A")
+            async let second: String = incrementCounter(counter, label: "B")
+            async let third: String = incrementCounter(counter, label: "C")
+
+            let summaries = await [first, second, third]
+            let finalValue = counter.snapshot()
+
+            for summary in summaries {
+                record(summary)
+            }
+
+            record("Final locked counter value: \(finalValue)")
+            record("@unchecked Sendable is a manual proof. If any access skips the lock, the conformance becomes a lie.")
+        }
+    }
+
+    private nonisolated func incrementCounter(_ counter: Stage7LockedImageCounter, label: String) async -> String {
+        try? await Task.sleep(for: .milliseconds(100))
+        let value = counter.increment()
+        return "Task \(label) incremented locked counter to \(value)"
     }
 
     private func record(_ message: String) {
