@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var stage4Model = Stage4LabModel()
     @State private var stage5Model = Stage5LabModel()
     @State private var stage6Model = Stage6LabModel()
+    @State private var stage7Model = Stage7LabModel()
 
     var body: some View {
         NavigationStack {
@@ -297,6 +298,40 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 7 — Sendable") {
+                    Text("Values crossing isolation boundaries")
+                        .font(.headline)
+
+                    Text("Compare immutable value types, actor references, mutable reference types, and @Sendable closures under Swift 6 strict concurrency checking.")
+
+                    Button(stage7Model.isRunning ? "Running…" : "Run Sendable Experiment") {
+                        stage7Model.runSendableExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage7Model.isRunning)
+                }
+
+                Section("Stage 7 Log") {
+                    if stage7Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "paperplane",
+                            description: Text("Run the Sendable experiment and inspect which values are safe to move across task and actor boundaries.")
+                        )
+                    } else {
+                        ForEach(stage7Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -367,6 +402,24 @@ private struct Stage6ImageRequestResult: Sendable {
         case .sharedInProgress:
             "Request \(label) shared existing in-progress download, bytes: \(image.bytes)"
         }
+    }
+}
+
+private struct Stage7ImageMetadata: Sendable {
+    let url: URL
+    let byteCount: Int
+    let tags: [String]
+}
+
+private struct Stage7SendableSummary: Sendable {
+    let messages: [String]
+}
+
+private final class Stage7MutableImageBox {
+    var byteCount: Int
+
+    init(byteCount: Int) {
+        self.byteCount = byteCount
     }
 }
 
@@ -547,6 +600,18 @@ private actor DeduplicatingImagePipeline {
 
     func totalUnderlyingDownloads() -> Int {
         downloadCount
+    }
+}
+
+private actor Stage7AuditLog {
+    private var records: [String] = []
+
+    func append(_ record: String) {
+        records.append(record)
+    }
+
+    func snapshot() -> [String] {
+        records
     }
 }
 
@@ -1203,6 +1268,73 @@ private final class Stage6LabModel {
 
         events.append(event)
         print("[Stage 6] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage7LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    func runSendableExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let metadata = Stage7ImageMetadata(
+                url: URL(string: "https://example.com/images/stage7.png")!,
+                byteCount: 128_000,
+                tags: ["sendable", "value", "image"]
+            )
+            let auditLog = Stage7AuditLog()
+            let scaleFactor = 2
+
+            let describe: @Sendable (Stage7ImageMetadata) async -> String = { metadata in
+                try? await Task.sleep(for: .milliseconds(250))
+                return "@Sendable closure processed \(metadata.url.lastPathComponent) at scale \(scaleFactor)x"
+            }
+
+            record("Sendable experiment started")
+            record("Immutable struct prepared: \(metadata.url.lastPathComponent), bytes: \(metadata.byteCount)")
+            record("Stage7ImageMetadata is Sendable because its stored properties are Sendable values")
+
+            let summary = await Task.detached(priority: .utility) { [metadata, auditLog, describe] in
+                await auditLog.append("Detached task received Sendable metadata for \(metadata.url.lastPathComponent)")
+
+                let closureResult = await describe(metadata)
+                await auditLog.append(closureResult)
+
+                await auditLog.append("Actor reference crossed the task boundary; its mutable records stayed actor-isolated")
+
+                return Stage7SendableSummary(messages: await auditLog.snapshot())
+            }.value
+
+            for message in summary.messages {
+                record(message)
+            }
+
+            let mutableBox = Stage7MutableImageBox(byteCount: 128_000)
+            record("Created mutable reference type locally: byteCount = \(mutableBox.byteCount)")
+            record("Diagnostic example, not compiled here: capturing Stage7MutableImageBox in Task.detached would be rejected because shared mutable class state is not Sendable")
+            record("Diagnostic example, not compiled here: an @Sendable closure that mutates a captured var counter would be rejected")
+            record("Experiment finished — Sendable is about safe movement across isolation domains, not about background threads")
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 7] \(message) — \(context)")
     }
 }
 
