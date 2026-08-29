@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var stage5Model = Stage5LabModel()
     @State private var stage6Model = Stage6LabModel()
     @State private var stage7Model = Stage7LabModel()
+    @State private var stage8Model = Stage8LabModel()
 
     var body: some View {
         NavigationStack {
@@ -338,6 +339,46 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 8 — Swift 6 Strict Concurrency Migration") {
+                    Text("Old service layer → explicit isolation model")
+                        .font(.headline)
+
+                    Text("Inspect a legacy shape with static shared, DispatchQueue, mutable class models, completions, and delegates; then run the migrated actor + async API.")
+
+                    Button("Run Legacy Diagnostic Walkthrough") {
+                        stage8Model.runLegacyDiagnosticWalkthrough()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage8Model.isRunning)
+
+                    Button(stage8Model.isRunning ? "Running…" : "Run Migrated Service Experiment") {
+                        stage8Model.runMigratedServiceExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage8Model.isRunning)
+                }
+
+                Section("Stage 8 Log") {
+                    if stage8Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "wrench.and.screwdriver",
+                            description: Text("Run the diagnostic walkthrough first, then run the migrated service and compare the isolation boundaries.")
+                        )
+                    } else {
+                        ForEach(stage8Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -421,6 +462,27 @@ private struct Stage7SendableSummary: Sendable {
     let messages: [String]
 }
 
+private struct Stage8ImageRequest: Identifiable, Sendable {
+    let id: Int
+    let url: URL
+}
+
+private struct Stage8ImageSnapshot: Identifiable, Sendable {
+    let id: Int
+    let url: URL
+    let bytes: Int
+    let revision: Int
+
+    var summary: String {
+        "image #\(id), bytes: \(bytes), revision: \(revision)"
+    }
+}
+
+private struct Stage8MigrationResult: Sendable {
+    let snapshots: [Stage8ImageSnapshot]
+    let cachedIDs: [Int]
+}
+
 private final class Stage7MutableImageBox {
     var byteCount: Int
 
@@ -462,6 +524,49 @@ private nonisolated final class Stage7LockedImageCounter: @unchecked Sendable {
 private nonisolated enum Stage2Context {
     @TaskLocal static var traceID: String = "unassigned"
 }
+
+#if STAGE8_BROKEN
+private final class Stage8LegacyImageRecord {
+    let id: Int
+    let url: URL
+    var bytes: Int
+
+    init(id: Int, url: URL, bytes: Int) {
+        self.id = id
+        self.url = url
+        self.bytes = bytes
+    }
+}
+
+private protocol Stage8LegacyImageServiceDelegate: AnyObject {
+    func legacyService(_ service: Stage8LegacyImageService, didUpdate record: Stage8LegacyImageRecord)
+}
+
+private final class Stage8LegacyImageService {
+    static let shared = Stage8LegacyImageService()
+
+    private let queue = DispatchQueue(label: "stage8.legacy.image-service", attributes: .concurrent)
+    private var records: [Int: Stage8LegacyImageRecord] = [:]
+
+    weak var delegate: Stage8LegacyImageServiceDelegate?
+
+    func fetchImage(id: Int, completion: @escaping (Stage8LegacyImageRecord) -> Void) {
+        queue.asyncAfter(deadline: .now() + .milliseconds(250)) {
+            let record = self.records[id] ?? Stage8LegacyImageRecord(
+                id: id,
+                url: URL(string: "https://example.com/images/legacy-\(id).png")!,
+                bytes: 32_000
+            )
+
+            record.bytes += 1_000
+            self.records[id] = record
+
+            completion(record)
+            self.delegate?.legacyService(self, didUpdate: record)
+        }
+    }
+}
+#endif
 
 private func simulateStage4Load(_ item: Stage4LoadItem) async throws -> String {
     print("[Stage 4] \(item.name) started — planned delay: \(item.delayMilliseconds)ms")
@@ -648,6 +753,67 @@ private actor Stage7AuditLog {
 
     func snapshot() -> [String] {
         records
+    }
+}
+
+private actor Stage8ImageRepository {
+    private var snapshots: [Int: Stage8ImageSnapshot] = [:]
+    private var nextRevision = 1
+
+    func removeAll() {
+        snapshots.removeAll()
+        nextRevision = 1
+    }
+
+    func snapshot(for request: Stage8ImageRequest) async -> Stage8ImageSnapshot {
+        if let cached = snapshots[request.id] {
+            return cached
+        }
+
+        try? await Task.sleep(for: .milliseconds(250 + request.id * 100))
+
+        let snapshot = Stage8ImageSnapshot(
+            id: request.id,
+            url: request.url,
+            bytes: 40_000 + request.id * 8_000,
+            revision: nextRevision
+        )
+
+        nextRevision += 1
+        snapshots[request.id] = snapshot
+
+        return snapshot
+    }
+
+    func cachedIDs() -> [Int] {
+        snapshots.keys.sorted()
+    }
+}
+
+private nonisolated struct Stage8MigratedImageService: Sendable {
+    let repository: Stage8ImageRepository
+
+    func loadGallery(_ requests: [Stage8ImageRequest]) async -> Stage8MigrationResult {
+        await repository.removeAll()
+
+        let snapshots = await withTaskGroup(of: Stage8ImageSnapshot.self) { group in
+            for request in requests {
+                group.addTask {
+                    await repository.snapshot(for: request)
+                }
+            }
+
+            var loaded: [Stage8ImageSnapshot] = []
+
+            for await snapshot in group {
+                loaded.append(snapshot)
+            }
+
+            return loaded.sorted { $0.id < $1.id }
+        }
+
+        let cachedIDs = await repository.cachedIDs()
+        return Stage8MigrationResult(snapshots: snapshots, cachedIDs: cachedIDs)
     }
 }
 
@@ -1415,6 +1581,80 @@ private final class Stage7LabModel {
 
         events.append(event)
         print("[Stage 7] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage8LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private let service = Stage8MigratedImageService(repository: Stage8ImageRepository())
+
+    func runLegacyDiagnosticWalkthrough() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+
+        record("Concept: migrate an old service by choosing ownership and isolation, not by silencing warnings")
+        record("Legacy shape: static shared singleton, DispatchQueue, mutable class records, escaping completion handler, weak delegate")
+        record("Prediction: if STAGE8_BROKEN is enabled, which values cross from the queue closure back to UI isolation?")
+
+        record("Diagnostic 1 — static shared mutable service: any isolation domain can reach the same reference and mutate shared records")
+        record("Refactor 1 — Stage8ImageRepository is an actor; it owns cache and revision state behind serialized actor isolation")
+
+        record("Diagnostic 2 — DispatchQueue closure captures non-Sendable self, completion, delegate, and mutable records")
+        record("Refactor 2 — replace queue callbacks with async functions; suspension is explicit at await points")
+
+        record("Diagnostic 3 — Stage8LegacyImageRecord is a mutable class passed across domains")
+        record("Refactor 3 — return Stage8ImageSnapshot, an immutable Sendable value type")
+
+        record("Diagnostic 4 — delegate callbacks do not encode UI isolation")
+        record("Refactor 4 — the MainActor view model awaits the service and mutates UI state only on MainActor")
+
+        record("Optional inspection: add -DSTAGE8_BROKEN to Other Swift Flags to compile the legacy sample and inspect Swift 6 diagnostics")
+    }
+
+    func runMigratedServiceExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let requests = [
+                Stage8ImageRequest(id: 1, url: URL(string: "https://example.com/images/migration-avatar.png")!),
+                Stage8ImageRequest(id: 2, url: URL(string: "https://example.com/images/migration-hero.png")!),
+                Stage8ImageRequest(id: 3, url: URL(string: "https://example.com/images/migration-badge.png")!)
+            ]
+
+            record("Migrated service experiment started")
+            record("MainActor view model created \(requests.count) Sendable image requests")
+            record("Calling async service API; repository mutable state belongs to Stage8ImageRepository actor")
+
+            let result = await service.loadGallery(requests)
+
+            for snapshot in result.snapshots {
+                record("Loaded Sendable snapshot: \(snapshot.summary)")
+            }
+
+            record("Repository cached IDs after load: \(result.cachedIDs.map(String.init).joined(separator: ", "))")
+            record("Experiment finished — no shared mutable class model, no callback queue hop, no delegate ambiguity")
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 8] \(message) — \(context)")
     }
 }
 
