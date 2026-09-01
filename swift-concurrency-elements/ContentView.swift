@@ -11,6 +11,7 @@ struct ContentView: View {
     @State private var stage7Model = Stage7LabModel()
     @State private var stage8Model = Stage8LabModel()
     @State private var stage9Model = Stage9LabModel()
+    @State private var stage10Model = Stage10LabModel()
 
     var body: some View {
         NavigationStack {
@@ -420,6 +421,46 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 10 — Region-Based Isolation and sending") {
+                    Text("Transfer ownership of a non-Sendable value")
+                        .font(.headline)
+
+                    Text("Move a unique mutable buffer into concurrent work with sending, then compare that with sharing a non-Sendable reference.")
+
+                    Button(stage10Model.isRunning ? "Running…" : "Run sending Transfer Experiment") {
+                        stage10Model.runSendingTransferExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage10Model.isRunning)
+
+                    Button("Explain Broken Use-After-Send Sample") {
+                        stage10Model.explainBrokenUseAfterSendSample()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage10Model.isRunning)
+                }
+
+                Section("Stage 10 Log") {
+                    if stage10Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "arrowshape.turn.up.right.circle",
+                            description: Text("Run the sending transfer experiment, then optionally enable STAGE10_BROKEN to inspect the use-after-transfer diagnostic.")
+                        )
+                    } else {
+                        ForEach(stage10Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -552,6 +593,17 @@ private struct Stage9TransformReport: Sendable {
     }
 }
 
+private struct Stage10BufferDigest: Sendable {
+    let label: String
+    let byteCount: Int
+    let checksum: Int
+    let mutationCount: Int
+
+    var summary: String {
+        "\(label): \(byteCount) bytes, checksum \(checksum), mutations performed after transfer: \(mutationCount)"
+    }
+}
+
 private final class Stage7MutableImageBox {
     var byteCount: Int
 
@@ -587,6 +639,34 @@ private nonisolated final class Stage7LockedImageCounter: @unchecked Sendable {
         defer { lock.unlock() }
 
         return value
+    }
+}
+
+private nonisolated final class Stage10Buffer {
+    var bytes: [UInt8]
+    private(set) var mutationCount = 0
+
+    init(bytes: [UInt8]) {
+        self.bytes = bytes
+    }
+
+    var count: Int {
+        bytes.count
+    }
+
+    func invertEveryFourthByte() {
+        guard !bytes.isEmpty else { return }
+
+        for index in stride(from: 0, to: bytes.count, by: 4) {
+            bytes[index] = 255 &- bytes[index]
+            mutationCount += 1
+        }
+    }
+
+    func checksum() -> Int {
+        bytes.reduce(0) { partial, byte in
+            (partial &* 31 &+ Int(byte)) % 1_000_003
+        }
     }
 }
 
@@ -929,6 +1009,32 @@ private nonisolated(nonsending) func stage9CallerContextProbe(label: String) asy
         isolationNote: "@concurrent nonisolated transform used only Sendable input and local state"
     )
 }
+
+@concurrent private nonisolated func stage10ConsumeBuffer(_ buffer: sending Stage10Buffer, label: String) async -> Stage10BufferDigest {
+    buffer.invertEveryFourthByte()
+    await Task.yield()
+
+    return Stage10BufferDigest(
+        label: label,
+        byteCount: buffer.count,
+        checksum: buffer.checksum(),
+        mutationCount: buffer.mutationCount
+    )
+}
+
+#if STAGE10_BROKEN
+@MainActor
+private func stage10BrokenUseAfterSendExample() async -> Int {
+    let buffer = Stage10Buffer(bytes: Array(0..<128).map(UInt8.init))
+    let digest = await stage10ConsumeBuffer(buffer, label: "broken sample")
+
+    print("Digest after transfer: \(digest.summary)")
+
+    // Expected Swift 6 diagnostic when STAGE10_BROKEN is enabled:
+    // using 'buffer' here attempts to access a non-Sendable reference after its region was transferred.
+    return buffer.count
+}
+#endif
 
 @MainActor
 @Observable
@@ -1829,6 +1935,61 @@ private final class Stage9LabModel {
 
         events.append(event)
         print("[Stage 9] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage10LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    func runSendingTransferExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            record("Concept: a non-Sendable reference can sometimes move safely if ownership is transferred, not shared")
+            record("Prediction: after passing the buffer to a sending parameter, should this MainActor task keep using that same reference?")
+
+            let bytes = Array(0..<192).map { UInt8($0 % 256) }
+            let buffer = Stage10Buffer(bytes: bytes)
+
+            record("Created non-Sendable Stage10Buffer on MainActor with \(buffer.count) bytes")
+            record("Transferring the buffer into @concurrent nonisolated work via a sending parameter")
+
+            let digest = await stage10ConsumeBuffer(buffer, label: "transferred buffer")
+
+            record(digest.summary)
+            record("After transfer, this task uses only the Sendable digest result, not the original non-Sendable buffer reference")
+            record("Mental model: region-based isolation can prove a one-way move even when the class itself is not broadly Sendable")
+        }
+    }
+
+    func explainBrokenUseAfterSendSample() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+
+        record("Broken sample is intentionally behind the STAGE10_BROKEN compilation flag")
+        record("If enabled, it transfers a Stage10Buffer with sending and then tries to read buffer.count afterward")
+        record("Prediction: Swift should reject that because the original isolation region no longer owns the transferred reference")
+        record("This is different from Sendable: the buffer class is still non-Sendable; the safe operation is a one-way ownership transfer")
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 10] \(message) — \(context)")
     }
 }
 
