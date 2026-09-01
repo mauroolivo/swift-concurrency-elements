@@ -10,6 +10,7 @@ struct ContentView: View {
     @State private var stage6Model = Stage6LabModel()
     @State private var stage7Model = Stage7LabModel()
     @State private var stage8Model = Stage8LabModel()
+    @State private var stage9Model = Stage9LabModel()
 
     var body: some View {
         NavigationStack {
@@ -379,6 +380,46 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 9 — Modern Swift Execution and Default Isolation") {
+                    Text("Caller context vs explicit concurrent execution")
+                        .font(.headline)
+
+                    Text("Compare an async helper that stays in the caller's isolation context with an explicitly concurrent CPU-style image transform.")
+
+                    Button(stage9Model.isRunning ? "Running…" : "Run Default Isolation Experiment") {
+                        stage9Model.runDefaultIsolationExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage9Model.isRunning)
+
+                    Button(stage9Model.isRunning ? "Running…" : "Run Explicit Concurrent Transform") {
+                        stage9Model.runConcurrentTransformExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage9Model.isRunning)
+                }
+
+                Section("Stage 9 Log") {
+                    if stage9Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "cpu",
+                            description: Text("Run the default isolation experiment first, predict which work stays with MainActor, then compare the concurrent transform.")
+                        )
+                    } else {
+                        ForEach(stage9Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -481,6 +522,34 @@ private struct Stage8ImageSnapshot: Identifiable, Sendable {
 private struct Stage8MigrationResult: Sendable {
     let snapshots: [Stage8ImageSnapshot]
     let cachedIDs: [Int]
+}
+
+private struct Stage9IsolationProbe: Sendable {
+    let label: String
+    let suspendedOnce: Bool
+    let isolationNote: String
+
+    var summary: String {
+        "\(label): suspended once = \(suspendedOnce), isolation note = \(isolationNote)"
+    }
+}
+
+private struct Stage9ImagePayload: Identifiable, Sendable {
+    let id: Int
+    let name: String
+    let pixelCount: Int
+    let seed: Int
+}
+
+private struct Stage9TransformReport: Sendable {
+    let imageName: String
+    let checksum: Int
+    let yieldedDuringTransform: Bool
+    let isolationNote: String
+
+    var summary: String {
+        "\(imageName): checksum \(checksum), yielded = \(yieldedDuringTransform), isolation note = \(isolationNote)"
+    }
 }
 
 private final class Stage7MutableImageBox {
@@ -828,6 +897,37 @@ private nonisolated func simulateStage6ImageDownload(from url: URL, label: Strin
     try? await Task.sleep(for: .milliseconds(500))
     print("[Stage 6] Request \(label) completed underlying image download")
     return CachedImage(url: url, bytes: 64_000)
+}
+
+private nonisolated(nonsending) func stage9CallerContextProbe(label: String) async -> Stage9IsolationProbe {
+    await Task.yield()
+
+    return Stage9IsolationProbe(
+        label: label,
+        suspendedOnce: true,
+        isolationNote: "nonisolated(nonsending) does not claim independent concurrent execution"
+    )
+}
+
+@concurrent private nonisolated func stage9DecodeAndTransform(_ payload: Stage9ImagePayload) async -> Stage9TransformReport {
+    var checksum = payload.seed
+    var yieldedDuringTransform = false
+
+    for index in 0..<payload.pixelCount {
+        checksum = (checksum &* 31 &+ index &+ payload.id) % 1_000_003
+
+        if index > 0, index.isMultiple(of: 60_000) {
+            yieldedDuringTransform = true
+            await Task.yield()
+        }
+    }
+
+    return Stage9TransformReport(
+        imageName: payload.name,
+        checksum: checksum,
+        yieldedDuringTransform: yieldedDuringTransform,
+        isolationNote: "@concurrent nonisolated transform used only Sendable input and local state"
+    )
 }
 
 @MainActor
@@ -1655,6 +1755,80 @@ private final class Stage8LabModel {
 
         events.append(event)
         print("[Stage 8] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage9LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    func runDefaultIsolationExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            record("Concept: with this project setting, app declarations are MainActor-isolated unless we explicitly choose otherwise")
+            record("Prediction: will awaiting a nonisolated(nonsending) helper force this task away from MainActor?")
+
+            let probe = await stage9CallerContextProbe(label: "nonisolated(nonsending) helper called from MainActor task")
+
+            record(probe.summary)
+            record("Observation target: the helper has no access to Stage9LabModel state, but it stays in the caller's execution context rather than declaring CPU work elsewhere")
+            record("Mental model: task inherits MainActor isolation; await is a suspension point, not a command to run in the background")
+        }
+    }
+
+    func runConcurrentTransformExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let payloads = [
+                Stage9ImagePayload(id: 1, name: "avatar decode", pixelCount: 180_000, seed: 17),
+                Stage9ImagePayload(id: 2, name: "hero transform", pixelCount: 220_000, seed: 29),
+                Stage9ImagePayload(id: 3, name: "thumbnail filter", pixelCount: 140_000, seed: 41)
+            ]
+
+            record("Concurrent transform experiment started from MainActor-isolated UI model")
+            record("Prediction: which state crosses the boundary? Only Sendable Stage9ImagePayload values, not the UI model")
+            record("Calling @concurrent nonisolated transform functions with async let")
+
+            async let first = stage9DecodeAndTransform(payloads[0])
+            async let second = stage9DecodeAndTransform(payloads[1])
+            async let third = stage9DecodeAndTransform(payloads[2])
+
+            let reports = await [first, second, third]
+
+            for report in reports {
+                record(report.summary)
+            }
+
+            record("Transform reports returned to MainActor before mutating events")
+            record("Design rule: keep UI ownership on MainActor; move Sendable inputs/results across the boundary for explicit concurrent work")
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 9] \(message) — \(context)")
     }
 }
 
