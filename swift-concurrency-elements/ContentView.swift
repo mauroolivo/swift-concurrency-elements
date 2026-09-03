@@ -12,6 +12,7 @@ struct ContentView: View {
     @State private var stage8Model = Stage8LabModel()
     @State private var stage9Model = Stage9LabModel()
     @State private var stage10Model = Stage10LabModel()
+    @State private var stage11Model = Stage11LabModel()
 
     var body: some View {
         NavigationStack {
@@ -461,6 +462,52 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 11 — Isolated Parameters and Isolation Forwarding") {
+                    Text("Split awaits vs actor-isolated transaction")
+                        .font(.headline)
+
+                    Text("Compare a logical operation split across multiple cross-actor awaits with a single API that forwards actor isolation through an isolated parameter.")
+
+                    Button(stage11Model.isRunning ? "Running…" : "Run Split-Await Sequence") {
+                        stage11Model.runSplitAwaitSequenceExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage11Model.isRunning)
+
+                    Button(stage11Model.isRunning ? "Running…" : "Run Isolated Transaction Experiment") {
+                        stage11Model.runIsolatedTransactionExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage11Model.isRunning)
+
+                    Button("Explain #isolation Forwarding Sample") {
+                        stage11Model.explainIsolationForwardingSample()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage11Model.isRunning)
+                }
+
+                Section("Stage 11 Log") {
+                    if stage11Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "lock.open.trianglebadge.exclamationmark",
+                            description: Text("Run the split-await sequence first, then compare with the isolated transaction API and inspect the actor audit trail order.")
+                        )
+                    } else {
+                        ForEach(stage11Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -604,6 +651,48 @@ private struct Stage10BufferDigest: Sendable {
     }
 }
 
+private struct Stage11TransactionReport: Sendable {
+    enum Mode: Sendable {
+        case splitAwait
+        case isolatedTransaction
+    }
+
+    let owner: String
+    let mode: Mode
+    let succeeded: Bool
+    let finalValue: Int?
+    let note: String
+
+    var summary: String {
+        let modeLabel = mode == .splitAwait ? "split-await" : "isolated-transaction"
+
+        if succeeded {
+            return "\(modeLabel) owner \(owner) succeeded, final value: \(finalValue ?? -1)"
+        } else {
+            return "\(modeLabel) owner \(owner) failed: \(note)"
+        }
+    }
+}
+
+private enum Stage11DatabaseError: Error, Sendable {
+    case transactionAlreadyActive(activeOwner: String, requestedOwner: String)
+    case noActiveTransaction(requestedOwner: String)
+    case ownerMismatch(activeOwner: String, requestedOwner: String)
+}
+
+extension Stage11DatabaseError: CustomStringConvertible {
+    var description: String {
+        switch self {
+        case .transactionAlreadyActive(let activeOwner, let requestedOwner):
+            "transactionAlreadyActive(active: \(activeOwner), requested: \(requestedOwner))"
+        case .noActiveTransaction(let requestedOwner):
+            "noActiveTransaction(requested: \(requestedOwner))"
+        case .ownerMismatch(let activeOwner, let requestedOwner):
+            "ownerMismatch(active: \(activeOwner), requested: \(requestedOwner))"
+        }
+    }
+}
+
 private final class Stage7MutableImageBox {
     var byteCount: Int
 
@@ -666,6 +755,88 @@ private nonisolated final class Stage10Buffer {
     func checksum() -> Int {
         bytes.reduce(0) { partial, byte in
             (partial &* 31 &+ Int(byte)) % 1_000_003
+        }
+    }
+}
+
+private actor Stage11Database {
+    private var values: [String: Int] = [:]
+    private var activeTransactionOwner: String?
+    private var auditTrailEntries: [String] = []
+
+    func reset() {
+        values.removeAll()
+        activeTransactionOwner = nil
+        auditTrailEntries.removeAll()
+    }
+
+    func begin(owner: String) throws {
+        if let activeTransactionOwner {
+            throw Stage11DatabaseError.transactionAlreadyActive(
+                activeOwner: activeTransactionOwner,
+                requestedOwner: owner
+            )
+        }
+
+        activeTransactionOwner = owner
+        auditTrailEntries.append("begin(owner: \(owner))")
+    }
+
+    func upsert(key: String, value: Int, owner: String) throws {
+        try ensureActiveOwner(owner)
+        values[key] = value
+        auditTrailEntries.append("upsert(owner: \(owner), key: \(key), value: \(value))")
+    }
+
+    func increment(key: String, by delta: Int, owner: String) throws {
+        try ensureActiveOwner(owner)
+        values[key, default: 0] += delta
+        auditTrailEntries.append("increment(owner: \(owner), key: \(key), delta: \(delta), now: \(values[key, default: 0]))")
+    }
+
+    func commit(owner: String) throws -> Int {
+        try ensureActiveOwner(owner)
+        activeTransactionOwner = nil
+        let transactionCount = values.count
+        auditTrailEntries.append("commit(owner: \(owner), trackedKeys: \(transactionCount))")
+        return transactionCount
+    }
+
+    func value(for key: String) -> Int {
+        values[key, default: 0]
+    }
+
+    func auditTrail() -> [String] {
+        auditTrailEntries
+    }
+
+    func withTransaction<R: Sendable>(
+        owner: String,
+        _ body: @Sendable (isolated Stage11Database) throws -> R
+    ) throws -> R {
+        try begin(owner: owner)
+
+        do {
+            let result = try body(self)
+            _ = try commit(owner: owner)
+            return result
+        } catch {
+            activeTransactionOwner = nil
+            auditTrailEntries.append("rollback(owner: \(owner), reason: \(error))")
+            throw error
+        }
+    }
+
+    private func ensureActiveOwner(_ owner: String) throws {
+        guard let activeTransactionOwner else {
+            throw Stage11DatabaseError.noActiveTransaction(requestedOwner: owner)
+        }
+
+        guard activeTransactionOwner == owner else {
+            throw Stage11DatabaseError.ownerMismatch(
+                activeOwner: activeTransactionOwner,
+                requestedOwner: owner
+            )
         }
     }
 }
@@ -1020,6 +1191,84 @@ private nonisolated(nonsending) func stage9CallerContextProbe(label: String) asy
         checksum: buffer.checksum(),
         mutationCount: buffer.mutationCount
     )
+}
+
+private nonisolated func stage11RunSplitAwaitSequence(
+    on database: Stage11Database,
+    owner: String,
+    key: String,
+    seed: Int
+) async -> Stage11TransactionReport {
+    do {
+        try await database.begin(owner: owner)
+        await Task.yield()
+
+        try await database.upsert(key: key, value: seed, owner: owner)
+        await Task.yield()
+
+        try await database.increment(key: key, by: 5, owner: owner)
+        await Task.yield()
+
+        _ = try await database.commit(owner: owner)
+        let finalValue = await database.value(for: key)
+
+        return Stage11TransactionReport(
+            owner: owner,
+            mode: .splitAwait,
+            succeeded: true,
+            finalValue: finalValue,
+            note: ""
+        )
+    } catch {
+        return Stage11TransactionReport(
+            owner: owner,
+            mode: .splitAwait,
+            succeeded: false,
+            finalValue: nil,
+            note: String(describing: error)
+        )
+    }
+}
+
+private func stage11ApplyDelta(
+    on database: isolated Stage11Database,
+    owner: String,
+    key: String,
+    seed: Int
+) throws -> Int {
+    // This helper runs inside the actor's isolation domain, so no await is needed here.
+    try database.upsert(key: key, value: seed, owner: owner)
+    try database.increment(key: key, by: 5, owner: owner)
+    return database.value(for: key)
+}
+
+private nonisolated func stage11RunIsolatedTransaction(
+    on database: Stage11Database,
+    owner: String,
+    key: String,
+    seed: Int
+) async -> Stage11TransactionReport {
+    do {
+        let finalValue = try await database.withTransaction(owner: owner) { isolatedDatabase in
+            try stage11ApplyDelta(on: isolatedDatabase, owner: owner, key: key, seed: seed)
+        }
+
+        return Stage11TransactionReport(
+            owner: owner,
+            mode: .isolatedTransaction,
+            succeeded: true,
+            finalValue: finalValue,
+            note: ""
+        )
+    } catch {
+        return Stage11TransactionReport(
+            owner: owner,
+            mode: .isolatedTransaction,
+            succeeded: false,
+            finalValue: nil,
+            note: String(describing: error)
+        )
+    }
 }
 
 #if STAGE10_BROKEN
@@ -1990,6 +2239,99 @@ private final class Stage10LabModel {
 
         events.append(event)
         print("[Stage 10] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage11LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    func runSplitAwaitSequenceExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let database = Stage11Database()
+            await database.reset()
+
+            record("Concept: a logical operation split into begin/update/commit creates multiple cross-actor suspension points")
+            record("Prediction: while owner A is suspended after begin, can owner B run and observe partially-complete transaction state?")
+
+            async let first = stage11RunSplitAwaitSequence(on: database, owner: "A", key: "hero", seed: 10)
+            async let second = stage11RunSplitAwaitSequence(on: database, owner: "B", key: "hero", seed: 40)
+
+            let reports = await [first, second]
+            for report in reports {
+                record(report.summary)
+            }
+
+            record("Actor audit trail for split-await sequence:")
+            for entry in await database.auditTrail() {
+                record("audit: \(entry)")
+            }
+
+            record("Observation: actor isolation serialized each entry, but the multi-step invariant spanned several awaits")
+        }
+    }
+
+    func runIsolatedTransactionExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let database = Stage11Database()
+            await database.reset()
+
+            record("Concept: isolation forwarding lets one API run a complete operation inside the actor domain")
+            record("Prediction: does the isolated helper need await for actor methods once it receives an isolated Stage11Database?")
+
+            async let first = stage11RunIsolatedTransaction(on: database, owner: "A", key: "hero", seed: 10)
+            async let second = stage11RunIsolatedTransaction(on: database, owner: "B", key: "hero", seed: 40)
+
+            let reports = await [first, second]
+            for report in reports {
+                record(report.summary)
+            }
+
+            record("Actor audit trail for isolated transaction API:")
+            for entry in await database.auditTrail() {
+                record("audit: \(entry)")
+            }
+
+            record("Observation: each transaction body ran as one actor-isolated operation with no intermediate await hops")
+        }
+    }
+
+    func explainIsolationForwardingSample() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        record("#isolation sample shape: func transaction(on database: isolated Stage11Database = #isolation) { ... }")
+        record("Meaning: caller can forward its current actor isolation explicitly when the API supports it")
+        record("Use this for APIs that should stay in an existing isolation domain, not for work that must run concurrently elsewhere")
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 11] \(message) — \(context)")
     }
 }
 
