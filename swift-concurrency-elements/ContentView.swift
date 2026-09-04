@@ -14,6 +14,7 @@ struct ContentView: View {
     @State private var stage10Model = Stage10LabModel()
     @State private var stage11Model = Stage11LabModel()
     @State private var stage12Model = Stage12LabModel()
+    @State private var stage13Model = Stage13LabModel()
 
     var body: some View {
         NavigationStack {
@@ -538,6 +539,58 @@ struct ContentView: View {
                         )
                     } else {
                         ForEach(stage12Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                Section("Stage 13 — AsyncSequence") {
+                    Text("Asynchronous streams and async iteration")
+                        .font(.headline)
+
+                    Text("Bridge a callback-style download into AsyncThrowingStream, then watch a buffered sensor stream drop intermediate values when the consumer lags behind.")
+
+                    Button(stage13Model.isRunning ? "Running…" : "Run Progress Stream Experiment") {
+                        stage13Model.runProgressStreamExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage13Model.isRunning)
+
+                    Button(stage13Model.isRunning ? "Running…" : "Run Failing Stream Experiment") {
+                        stage13Model.runFailingStreamExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage13Model.isRunning)
+
+                    Button(stage13Model.isRunning ? "Running…" : "Run Buffered Sensor Stream Experiment") {
+                        stage13Model.runBufferedSensorStreamExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage13Model.isRunning)
+
+                    Button("Cancel Stage 13 Experiment") {
+                        stage13Model.cancelExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!stage13Model.isRunning)
+                }
+
+                Section("Stage 13 Log") {
+                    if stage13Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "waveform.path.ecg",
+                            description: Text("Run a stream experiment and inspect how values arrive over time, how buffering affects delivery, and how cancellation terminates the producer.")
+                        )
+                    } else {
+                        ForEach(stage13Model.events) { event in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(event.message)
                                     .font(.body)
@@ -1469,7 +1522,7 @@ private final class Stage12LabModel {
 }
 
 #if STAGE12_BROKEN
-private func stage12BrokenGenericEquality(_ lhs: Stage12GalleryViewModel, _ rhs: Stage12GalleryViewModel) -> Bool {
+nonisolated private func stage12BrokenGenericEquality(_ lhs: Stage12GalleryViewModel, _ rhs: Stage12GalleryViewModel) -> Bool {
     lhs == rhs
 }
 #endif
@@ -2535,6 +2588,277 @@ private final class Stage11LabModel {
 
         events.append(event)
         print("[Stage 11] \(message) — \(context)")
+    }
+}
+
+private struct Stage13DownloadProgress: Identifiable, Sendable {
+    let step: Int
+    let totalSteps: Int
+    let bytesDownloaded: Int
+
+    var id: Int { step }
+
+    var fractionCompleted: Double {
+        Double(step) / Double(totalSteps)
+    }
+
+    var summary: String {
+        let percentage = Int((fractionCompleted * 100).rounded())
+        return "progress step \(step)/\(totalSteps) — \(bytesDownloaded) bytes (\(percentage)%)"
+    }
+}
+
+private struct Stage13SensorSample: Identifiable, Sendable {
+    let sequence: Int
+    let temperatureCelsius: Double
+    let humidityPercent: Int
+    let timestamp: Date
+
+    var id: Int { sequence }
+
+    var summary: String {
+        let time = timestamp.formatted(date: .omitted, time: .standard)
+        return "sample \(sequence) — \(temperatureCelsius.formatted(.number.precision(.fractionLength(1))))°C, \(humidityPercent)% humidity, time: \(time)"
+    }
+}
+
+private enum Stage13StreamError: Error, Sendable, CustomStringConvertible {
+    case cancelled
+    case failed(step: Int)
+
+    var description: String {
+        switch self {
+        case .cancelled:
+            "cancelled"
+        case .failed(let step):
+            "failed(step: \(step))"
+        }
+    }
+}
+
+@MainActor
+private final class Stage13LegacyDownloadService {
+    private var task: Task<Void, Never>?
+
+    func start(
+        assetName: String,
+        failAtStep: Int?,
+        progress: @escaping @Sendable (Stage13DownloadProgress) -> Void,
+        completion: @escaping @Sendable (Result<Void, Stage13StreamError>) -> Void
+    ) {
+        task?.cancel()
+
+        task = Task {
+            let totalSteps = 6
+
+            for step in 1...totalSteps {
+                if Task.isCancelled {
+                    completion(.failure(.cancelled))
+                    return
+                }
+
+                try? await Task.sleep(for: .milliseconds(180))
+
+                if Task.isCancelled {
+                    completion(.failure(.cancelled))
+                    return
+                }
+
+                let bytesDownloaded = step * 18_000
+                progress(
+                    Stage13DownloadProgress(
+                        step: step,
+                        totalSteps: totalSteps,
+                        bytesDownloaded: bytesDownloaded
+                    )
+                )
+
+                if let failAtStep, step == failAtStep {
+                    completion(.failure(.failed(step: step)))
+                    return
+                }
+            }
+
+            completion(.success(()))
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+}
+
+private func stage13DownloadProgressStream(
+    assetName: String,
+    failAtStep: Int? = nil
+) -> AsyncThrowingStream<Stage13DownloadProgress, Error> {
+    let service = Stage13LegacyDownloadService()
+
+    return AsyncThrowingStream(bufferingPolicy: .bufferingNewest(2)) { continuation in
+        service.start(
+            assetName: assetName,
+            failAtStep: failAtStep,
+            progress: { continuation.yield($0) },
+            completion: { result in
+                switch result {
+                case .success:
+                    continuation.finish()
+                case .failure(let error):
+                    continuation.finish(throwing: error)
+                }
+            }
+        )
+
+        continuation.onTermination = { @Sendable _ in
+            Task { @MainActor in
+                service.cancel()
+            }
+        }
+    }
+}
+
+private func stage13BufferedSensorStream() -> AsyncStream<Stage13SensorSample> {
+    AsyncStream(bufferingPolicy: .bufferingNewest(3)) { continuation in
+        let producer = Task {
+            for sequence in 1...10 {
+                if Task.isCancelled {
+                    break
+                }
+
+                try? await Task.sleep(for: .milliseconds(90))
+
+                continuation.yield(
+                    Stage13SensorSample(
+                        sequence: sequence,
+                        temperatureCelsius: 21.0 + Double(sequence) * 0.3,
+                        humidityPercent: 42 + sequence,
+                        timestamp: Date()
+                    )
+                )
+            }
+
+            continuation.finish()
+        }
+
+        continuation.onTermination = { @Sendable _ in
+            producer.cancel()
+        }
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage13LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private var experimentTask: Task<Void, Never>?
+
+    func runProgressStreamExperiment() {
+        startExperiment {
+            self.record("Progress stream experiment started")
+            self.record("Bridging a callback-style download into AsyncThrowingStream with bufferingNewest(2)")
+            self.record("Prediction: if the consumer slows down, will every intermediate progress update still be delivered?")
+
+            do {
+                var observedSteps: [Int] = []
+
+                for try await progress in stage13DownloadProgressStream(assetName: "hero.png") {
+                    observedSteps.append(progress.step)
+                    self.record(progress.summary)
+
+                    if progress.step == 2 {
+                        self.record("Consumer intentionally pauses here to let the producer outrun the buffer")
+                        try? await Task.sleep(for: .milliseconds(360))
+                    } else {
+                        try? await Task.sleep(for: .milliseconds(120))
+                    }
+                }
+
+                self.record("Stream finished after observing steps: \(observedSteps.map(String.init).joined(separator: ", "))")
+                self.record("Takeaway: AsyncStream buffers values independently of the consumer, but buffering policy decides which values survive pressure")
+            } catch {
+                self.record("Progress stream failed with error: \(error)")
+            }
+        }
+    }
+
+    func runFailingStreamExperiment() {
+        startExperiment {
+            self.record("Failing stream experiment started")
+            self.record("Prediction: what does the consumer see when the legacy callback API reports an error mid-stream?")
+
+            do {
+                var observedSteps: [Int] = []
+
+                for try await progress in stage13DownloadProgressStream(assetName: "broken-hero.png", failAtStep: 4) {
+                    observedSteps.append(progress.step)
+                    self.record(progress.summary)
+                }
+
+                self.record("Unexpectedly finished without error; observed steps: \(observedSteps.map(String.init).joined(separator: ", "))")
+            } catch {
+                self.record("Consumer caught stream error: \(error)")
+                self.record("AsyncThrowingStream cleanly propagated the error from the callback-driven producer")
+            }
+        }
+    }
+
+    func runBufferedSensorStreamExperiment() {
+        startExperiment {
+            self.record("Buffered sensor stream experiment started")
+            self.record("Producer emits temperature samples every 90ms while the consumer pauses for 220ms between reads")
+            self.record("Prediction: which sequence numbers will be missing once bufferingNewest(3) starts dropping older values?")
+
+            var observedSequences: [Int] = []
+
+            for await sample in stage13BufferedSensorStream() {
+                if let previous = observedSequences.last, sample.sequence > previous + 1 {
+                    self.record("Buffer dropped \(sample.sequence - previous - 1) intermediate samples before sequence \(sample.sequence)")
+                }
+
+                observedSequences.append(sample.sequence)
+                self.record(sample.summary)
+
+                try? await Task.sleep(for: .milliseconds(220))
+            }
+
+            self.record("Sensor stream finished after observing sequences: \(observedSequences.map(String.init).joined(separator: ", "))")
+            self.record("Takeaway: the producer and consumer are decoupled; buffering policy is part of the API contract")
+        }
+    }
+
+    func cancelExperiment() {
+        guard let experimentTask else { return }
+
+        record("Cancel requested for Stage 13 task")
+        experimentTask.cancel()
+    }
+
+    private func startExperiment(_ operation: @escaping @MainActor () async -> Void) {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            await operation()
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 13] \(message) — \(context)")
     }
 }
 
