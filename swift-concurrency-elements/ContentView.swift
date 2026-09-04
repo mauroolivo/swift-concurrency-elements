@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var stage9Model = Stage9LabModel()
     @State private var stage10Model = Stage10LabModel()
     @State private var stage11Model = Stage11LabModel()
+    @State private var stage12Model = Stage12LabModel()
 
     var body: some View {
         NavigationStack {
@@ -508,6 +509,46 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 12 — Isolated Protocol Conformances") {
+                    Text("MainActor-isolated Equatable view model")
+                        .font(.headline)
+
+                    Text("Compare a MainActor-isolated class inside a generic Equatable helper, then inspect why a nonisolated conformance would be a problem under Swift 6 strict concurrency.")
+
+                    Button(stage12Model.isRunning ? "Running…" : "Run Isolated Conformance Experiment") {
+                        stage12Model.runIsolatedConformanceExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage12Model.isRunning)
+
+                    Button("Explain Broken Nonisolated Conformance Sample") {
+                        stage12Model.explainBrokenNonisolatedSample()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage12Model.isRunning)
+                }
+
+                Section("Stage 12 Log") {
+                    if stage12Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "text.badge.checkmark",
+                            description: Text("Run the isolated conformance experiment, then inspect the generic helper and the Sendable snapshot note.")
+                        )
+                    } else {
+                        ForEach(stage12Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -671,6 +712,26 @@ private struct Stage11TransactionReport: Sendable {
         } else {
             return "\(modeLabel) owner \(owner) failed: \(note)"
         }
+    }
+}
+
+private struct Stage12GalleryItem: Identifiable, Sendable, Equatable {
+    let id: Int
+    let title: String
+    let isPinned: Bool
+
+    var label: String {
+        isPinned ? "\(title) 📌" : title
+    }
+}
+
+private struct Stage12GallerySnapshot: Sendable {
+    let title: String
+    let selectedTitle: String
+    let itemCount: Int
+
+    var summary: String {
+        "\(title): selected \(selectedTitle), \(itemCount) items"
     }
 }
 
@@ -1270,6 +1331,148 @@ private nonisolated func stage11RunIsolatedTransaction(
         )
     }
 }
+
+@MainActor
+private final class Stage12GalleryViewModel {
+    let identifier: Int
+    var title: String
+    var selectedIndex: Int
+    var items: [Stage12GalleryItem]
+
+    init(identifier: Int, title: String, selectedIndex: Int, items: [Stage12GalleryItem]) {
+        self.identifier = identifier
+        self.title = title
+        self.selectedIndex = selectedIndex
+        self.items = items
+    }
+
+    var selectedItem: Stage12GalleryItem {
+        items[selectedIndex]
+    }
+
+    func snapshot() -> Stage12GallerySnapshot {
+        Stage12GallerySnapshot(
+            title: title,
+            selectedTitle: selectedItem.label,
+            itemCount: items.count
+        )
+    }
+}
+
+@MainActor
+extension Stage12GalleryViewModel: Equatable {
+    static func == (lhs: Stage12GalleryViewModel, rhs: Stage12GalleryViewModel) -> Bool {
+        lhs.identifier == rhs.identifier
+            && lhs.title == rhs.title
+            && lhs.selectedIndex == rhs.selectedIndex
+            && lhs.items == rhs.items
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage12LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    func runIsolatedConformanceExperiment() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        Task {
+            defer {
+                isRunning = false
+            }
+
+            let primary = Stage12GalleryViewModel(
+                identifier: 1,
+                title: "Featured",
+                selectedIndex: 1,
+                items: [
+                    Stage12GalleryItem(id: 1, title: "Avatar", isPinned: false),
+                    Stage12GalleryItem(id: 2, title: "Hero", isPinned: true),
+                    Stage12GalleryItem(id: 3, title: "Badge", isPinned: false)
+                ]
+            )
+
+            let duplicate = Stage12GalleryViewModel(
+                identifier: 1,
+                title: "Featured",
+                selectedIndex: 1,
+                items: [
+                    Stage12GalleryItem(id: 1, title: "Avatar", isPinned: false),
+                    Stage12GalleryItem(id: 2, title: "Hero", isPinned: true),
+                    Stage12GalleryItem(id: 3, title: "Badge", isPinned: false)
+                ]
+            )
+
+            let different = Stage12GalleryViewModel(
+                identifier: 2,
+                title: "Library",
+                selectedIndex: 0,
+                items: [
+                    Stage12GalleryItem(id: 4, title: "Backdrop", isPinned: true),
+                    Stage12GalleryItem(id: 5, title: "Thumbnail", isPinned: false)
+                ]
+            )
+
+            record("Concept: a MainActor-isolated reference type can conform to Equatable, but the witness still belongs to the MainActor isolation domain")
+            record("Prediction: should a generic helper that uses == stay on MainActor when the conformance is isolated?")
+
+            let primaryMatchesDuplicate = stage12AreEqual(primary, duplicate)
+            let primaryMatchesDifferent = stage12AreEqual(primary, different)
+
+            record("Generic Equatable helper result — primary vs duplicate: \(primaryMatchesDuplicate)")
+            record("Generic Equatable helper result — primary vs different: \(primaryMatchesDifferent)")
+
+            let matchingCount = stage12CountMatches(primary, in: [primary, duplicate, different])
+            record("Generic Equatable helper counted \(matchingCount) matching isolated view models")
+
+            let snapshot = primary.snapshot()
+            record("Sendable snapshot for cross-boundary work: \(snapshot.summary)")
+            record("The view model itself remains MainActor-isolated; if you need to move data elsewhere, snapshot the value you need instead of shipping the class around")
+            record("Observation: isolated protocol conformances keep protocol requirements honest about actor ownership instead of pretending the implementation is freely cross-thread")
+        }
+    }
+
+    func explainBrokenNonisolatedSample() {
+        guard !isRunning else { return }
+
+        events.removeAll()
+        record("Broken sample is intentionally behind the STAGE12_BROKEN compilation flag")
+        record("If enabled, a nonisolated helper would try to compare Stage12GalleryViewModel values from outside MainActor")
+        record("Expected diagnostic: the Equatable witness is isolated, so the comparison must happen inside the MainActor isolation domain")
+        record("Do not fix this by making == nonisolated unless the implementation stops touching actor-isolated state")
+        record("Optional inspection: add -DSTAGE12_BROKEN to Other Swift Flags and rebuild to see the compiler explain the isolation mismatch")
+    }
+
+    @MainActor
+    private func stage12AreEqual<T: Equatable>(_ lhs: T, _ rhs: T) -> Bool {
+        lhs == rhs
+    }
+
+    @MainActor
+    private func stage12CountMatches<T: Equatable>(_ probe: T, in values: [T]) -> Int {
+        values.filter { $0 == probe }.count
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 12] \(message) — \(context)")
+    }
+}
+
+#if STAGE12_BROKEN
+private func stage12BrokenGenericEquality(_ lhs: Stage12GalleryViewModel, _ rhs: Stage12GalleryViewModel) -> Bool {
+    lhs == rhs
+}
+#endif
 
 #if STAGE10_BROKEN
 @MainActor
