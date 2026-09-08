@@ -15,6 +15,7 @@ struct ContentView: View {
     @State private var stage11Model = Stage11LabModel()
     @State private var stage12Model = Stage12LabModel()
     @State private var stage13Model = Stage13LabModel()
+    @State private var stage14Model = Stage14LabModel()
 
     var body: some View {
         NavigationStack {
@@ -591,6 +592,58 @@ struct ContentView: View {
                         )
                     } else {
                         ForEach(stage13Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                Section("Stage 14 — Continuations") {
+                    Text("Bridge callback APIs into async/await")
+                        .font(.headline)
+
+                    Text("Compare correct continuation usage with intentional bugs: resume twice and never resume. Understand checked vs unsafe continuations.")
+
+                    Button(stage14Model.isRunning ? "Running…" : "Run Successful Bridge Experiment") {
+                        stage14Model.runSuccessfulBridgeExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage14Model.isRunning)
+
+                    Button(stage14Model.isRunning ? "Running…" : "Run Resume Twice Bug") {
+                        stage14Model.runResumeTwiceBugExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage14Model.isRunning)
+
+                    Button(stage14Model.isRunning ? "Running…" : "Run Never Resume Bug") {
+                        stage14Model.runNeverResumeBugExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage14Model.isRunning)
+
+                    Button(stage14Model.isRunning ? "Running…" : "Compare Checked vs Unsafe") {
+                        stage14Model.runCheckedVsUnsafeComparison()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage14Model.isRunning)
+                }
+
+                Section("Stage 14 Log") {
+                    if stage14Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "arrow.left.arrow.right",
+                            description: Text("Run a continuation experiment and inspect how checked continuations guard against double-resume and missing-resume bugs.")
+                        )
+                    } else {
+                        ForEach(stage14Model.events) { event in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(event.message)
                                     .font(.body)
@@ -2859,6 +2912,286 @@ private final class Stage13LabModel {
 
         events.append(event)
         print("[Stage 13] \(message) — \(context)")
+    }
+}
+
+// MARK: - Stage 14 Model Types
+
+private struct Stage14CallbackResult: Sendable {
+    let label: String
+    let value: String
+    let durationMs: Int
+}
+
+private enum Stage14ContinuationError: Error, Sendable {
+    case timeout
+    case cancelled
+    case operationFailed(reason: String)
+}
+
+// MARK: - Stage 14 Lab Model
+
+@MainActor
+@Observable
+private final class Stage14LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private var experimentTask: Task<Void, Never>?
+
+    func runSuccessfulBridgeExperiment() {
+        startExperiment {
+            self.record("Successful continuation bridge experiment started")
+            self.record("Concept: withCheckedThrowingContinuation bridges a callback API into async/await")
+            self.record("A checked continuation verifies that the callback resumes exactly once")
+            self.record("")
+
+            // Demonstrate a legacy callback-style function
+            let result = await self.legacyAsyncOperationBridged(label: "Bridge Test")
+            self.record("Result: \(result.label) = '\(result.value)' after \(result.durationMs)ms")
+            self.record("")
+            self.record("Outcome: callback resumed exactly once, continuation properly delivered the value to the caller")
+        }
+    }
+
+    func runResumeTwiceBugExperiment() {
+        startExperiment {
+            self.record("Resume-twice bug experiment started")
+            self.record("Scenario: a buggy callback API resumes the continuation twice")
+            self.record("Expected behavior: checked continuation will **CRASH** with a fatal error")
+            self.record("")
+            self.record("Watch the console output and observe the crash...")
+            self.record("")
+
+            let result = await self.legacyAsyncOperationBuggyResumeTwice(label: "Bug Test")
+            self.record("Result returned: \(result.label) = '\(result.value)' after \(result.durationMs)ms")
+            self.record("")
+            self.record("If you see this message, the continuation was NOT called twice.")
+            self.record("In normal execution, calling continuation.resume() a second time causes a fatal crash.")
+            self.record("This crash is intentional—it enforces the 'resume exactly once' contract.")
+        }
+    }
+
+    func runNeverResumeBugExperiment() {
+        startExperiment {
+            self.record("Never-resume bug experiment started")
+            self.record("Scenario: a buggy callback API never calls the callback, so the continuation is never resumed")
+            self.record("Expected behavior: the caller will wait indefinitely")
+            self.record("")
+
+            let timeoutTask = Task {
+                try? await Task.sleep(for: .seconds(3))
+                if self.isRunning {
+                    self.record("⏱️ Timeout: the continuation was never resumed after 3 seconds")
+                    self.record("This demonstrates the consequence of missing a resume call: the task hangs")
+                }
+            }
+
+            // Set a timeout for this experiment
+            _ = await self.legacyAsyncOperationNeverResumes(label: "Never Resume Test")
+
+            await timeoutTask.value
+        }
+    }
+
+    func runCheckedVsUnsafeComparison() {
+        startExperiment {
+            self.record("===== DEMO 1: Checked Continuation (Correct Usage) =====")
+            self.record("Starting a checked continuation with proper callback...")
+            
+            let checkedResult = await self.legacyAsyncOperationCheckedCorrect(label: "Checked-OK")
+            self.record("✅ Checked continuation result: \(checkedResult.value)")
+            self.record("")
+            
+            self.record("===== DEMO 2: Unsafe Continuation (Correct Usage) =====")
+            self.record("Starting an unsafe continuation with proper callback...")
+            
+            let unsafeResult = await self.legacyAsyncOperationUnsafeCorrect(label: "Unsafe-OK")
+            self.record("✅ Unsafe continuation result: \(unsafeResult.value)")
+            self.record("")
+            
+            self.record("===== KEY INSIGHT: Both Crash on Double Resume =====")
+            self.record("")
+            
+            self.record("withCheckedContinuation + Double Resume:")
+            self.record("  continuation.resume(returning: value1)  // ✅ First resume OK")
+            self.record("  continuation.resume(returning: value2)  // ❌ CRASHES with diagnostic")
+            self.record("  Error: 'resuming a continuation more than once is undefined behavior'")
+            self.record("  → Clear error message helps debugging")
+            self.record("")
+            
+            self.record("withUnsafeContinuation + Double Resume:")
+            self.record("  continuation.resume(returning: value1)  // ✅ First resume OK")
+            self.record("  continuation.resume(returning: value2)  // ❌ ALSO CRASHES!")
+            self.record("  Error: Undefined behavior (no diagnostic message)")
+            self.record("  → Cryptic crash makes debugging harder")
+            self.record("")
+            
+            self.record("===== WHY BOTH CRASH =====")
+            self.record("")
+            self.record("Both continuations track internal state:")
+            self.record("  case notResumed")
+            self.record("  case resumed")
+            self.record("  case invalid  // Already resumed")
+            self.record("")
+            self.record("Difference:")
+            self.record("  • Checked: Validates state, crashes with helpful message")
+            self.record("  • Unsafe: Skips validation, crashes with undefined behavior")
+            self.record("")
+            self.record("Both violate the 'resume exactly once' contract → both crash")
+            self.record("The 'unsafe' means 'no diagnostic', not 'more permissive'")
+            self.record("")
+            
+            self.record("===== BEST PRACTICE =====")
+            self.record("1. Always start with withCheckedContinuation")
+            self.record("2. Get clear diagnostics when callbacks are buggy")
+            self.record("3. Only use withUnsafeContinuation after:")
+            self.record("   • Proving callback resumes exactly once (through testing)")
+            self.record("   • Profiling shows checked overhead matters")
+            self.record("   • You fully control the callback implementation")
+            self.record("")
+            self.record("'Unsafe' is a commitment, not a permission. You're guaranteeing correctness.")
+        }
+    }
+
+    // MARK: - Bridge Implementations
+
+    private func legacyAsyncOperationCheckedCorrect(label: String) async -> Stage14CallbackResult {
+        return await withCheckedContinuation { continuation in
+            print("[Stage 14] Starting checked continuation (correct): \(label)")
+
+            Task.detached {
+                try? await Task.sleep(for: .milliseconds(300))
+
+                print("[Stage 14] Checked callback firing exactly once for: \(label)")
+
+                let result = Stage14CallbackResult(
+                    label: label,
+                    value: "success-checked",
+                    durationMs: 300
+                )
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    private func legacyAsyncOperationUnsafeCorrect(label: String) async -> Stage14CallbackResult {
+        return await withUnsafeContinuation { continuation in
+            print("[Stage 14] Starting unsafe continuation (correct): \(label)")
+
+            Task.detached {
+                try? await Task.sleep(for: .milliseconds(300))
+
+                print("[Stage 14] Unsafe callback firing exactly once for: \(label)")
+
+                let result = Stage14CallbackResult(
+                    label: label,
+                    value: "success-unsafe",
+                    durationMs: 300
+                )
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    private func legacyAsyncOperationBridged(label: String) async -> Stage14CallbackResult {
+        return await withCheckedContinuation { continuation in
+            print("[Stage 14] Starting legacy operation: \(label)")
+
+            // Simulate a legacy callback-based API
+            Task.detached {
+                try? await Task.sleep(for: .milliseconds(500))
+
+                print("[Stage 14] Legacy callback firing for: \(label)")
+
+                // Resume the continuation exactly once
+                let result = Stage14CallbackResult(
+                    label: label,
+                    value: "success",
+                    durationMs: 500
+                )
+                continuation.resume(returning: result)
+            }
+        }
+    }
+
+    private func legacyAsyncOperationBuggyResumeTwice(label: String) async -> Stage14CallbackResult {
+        return await withCheckedContinuation { continuation in
+            print("[Stage 14] Starting buggy legacy operation (resume twice): \(label)")
+
+            Task.detached {
+                try? await Task.sleep(for: .milliseconds(300))
+
+                let result = Stage14CallbackResult(
+                    label: label,
+                    value: "first-attempt",
+                    durationMs: 300
+                )
+
+                print("[Stage 14] Buggy callback firing first resume for: \(label)")
+                continuation.resume(returning: result)
+
+                // BUG: Resume again!
+                // This will cause a FATAL ERROR in the checked continuation
+                try? await Task.sleep(for: .milliseconds(200))
+                print("[Stage 14] Buggy callback attempting second resume for: \(label)")
+
+                let secondResult = Stage14CallbackResult(
+                    label: label,
+                    value: "second-attempt",
+                    durationMs: 500
+                )
+                
+                
+                
+                // ⚠️ The next line will crash: "Swift Concurrency error: resuming a continuation more than once is undefined behavior"
+                continuation.resume(returning: secondResult)
+            }
+        }
+    }
+
+    private func legacyAsyncOperationNeverResumes(label: String) async -> Stage14CallbackResult {
+        return await withCheckedContinuation { continuation in
+            print("[Stage 14] Starting buggy legacy operation (never resume): \(label)")
+
+            Task.detached {
+                // BUG: This callback never calls continuation.resume()
+                print("[Stage 14] Buggy callback started but will never call the continuation for: \(label)")
+
+                try? await Task.sleep(for: .seconds(10))
+                print("[Stage 14] (This line will never print because we're blocking the experiment)")
+            }
+
+            // The continuation is never resumed, so the caller will wait forever
+            // until cancellation or timeout
+        }
+    }
+
+    // MARK: - Experiment Helpers
+
+    private func startExperiment(_ operation: @escaping @MainActor () async -> Void) {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            await operation()
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 14] \(message) — \(context)")
     }
 }
 

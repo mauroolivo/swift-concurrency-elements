@@ -8,11 +8,15 @@
 
 /* Begin PBXBuildFile section */
 		34F4F5D8303C996E001A9A99 /* CONCURRENCY_COURSE_PROMPT.md in Resources */ = {isa = PBXBuildFile; fileRef = 34F4F5D7303C996E001A9A99 /* CONCURRENCY_COURSE_PROMPT.md */; };
+		34F96D0C3050A1F300AFD247 /* UNSAFE_VS_CHECKED_DEEP_DIVE.md in Resources */ = {isa = PBXBuildFile; fileRef = 34F96D0B3050A1F300AFD247 /* UNSAFE_VS_CHECKED_DEEP_DIVE.md */; };
+		34F96D0E3050A27800AFD247 /* CONTINUATION_DETECTION_EXPLANATION.md in Resources */ = {isa = PBXBuildFile; fileRef = 34F96D0D3050A27800AFD247 /* CONTINUATION_DETECTION_EXPLANATION.md */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		34F4F5C9303C98AE001A9A99 /* swift-concurrency-elements.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "swift-concurrency-elements.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		34F4F5D7303C996E001A9A99 /* CONCURRENCY_COURSE_PROMPT.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = CONCURRENCY_COURSE_PROMPT.md; sourceTree = "<group>"; };
+		34F96D0B3050A1F300AFD247 /* UNSAFE_VS_CHECKED_DEEP_DIVE.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = UNSAFE_VS_CHECKED_DEEP_DIVE.md; sourceTree = "<group>"; };
+		34F96D0D3050A27800AFD247 /* CONTINUATION_DETECTION_EXPLANATION.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = CONTINUATION_DETECTION_EXPLANATION.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -38,6 +42,8 @@
 			isa = PBXGroup;
 			children = (
 				34F4F5D7303C996E001A9A99 /* CONCURRENCY_COURSE_PROMPT.md */,
+				34F96D0B3050A1F300AFD247 /* UNSAFE_VS_CHECKED_DEEP_DIVE.md */,
+				34F96D0D3050A27800AFD247 /* CONTINUATION_DETECTION_EXPLANATION.md */,
 				34F4F5CB303C98AE001A9A99 /* swift-concurrency-elements */,
 				34F4F5CA303C98AE001A9A99 /* Products */,
 			);
@@ -115,7 +121,9 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				34F96D0C3050A1F300AFD247 /* UNSAFE_VS_CHECKED_DEEP_DIVE.md in Resources */,
 				34F4F5D8303C996E001A9A99 /* CONCURRENCY_COURSE_PROMPT.md in Resources */,
+				34F96D0E3050A27800AFD247 /* CONTINUATION_DETECTION_EXPLANATION.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
