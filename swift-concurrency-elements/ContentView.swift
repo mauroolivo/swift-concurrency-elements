@@ -1,3 +1,4 @@
+import Synchronization
 import SwiftUI
 
 struct ContentView: View {
@@ -16,6 +17,7 @@ struct ContentView: View {
     @State private var stage12Model = Stage12LabModel()
     @State private var stage13Model = Stage13LabModel()
     @State private var stage14Model = Stage14LabModel()
+    @State private var stage15Model = Stage15LabModel()
 
     var body: some View {
         NavigationStack {
@@ -644,6 +646,52 @@ struct ContentView: View {
                         )
                     } else {
                         ForEach(stage14Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
+                Section("Stage 15 — Synchronization Primitives Below Actors") {
+                    Text("Tiny synchronous critical sections")
+                        .font(.headline)
+
+                    Text("Compare a Mutex-protected counter with an actor-backed counter. The mutex keeps the critical section synchronous; the actor keeps the API isolated and suspension-aware.")
+
+                    Button(stage15Model.isRunning ? "Running…" : "Run Mutex Counter Experiment") {
+                        stage15Model.runMutexCounterExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage15Model.isRunning)
+
+                    Button(stage15Model.isRunning ? "Running…" : "Run Actor Counter Experiment") {
+                        stage15Model.runActorCounterExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage15Model.isRunning)
+
+                    Button(stage15Model.isRunning ? "Running…" : "Run Side-by-Side Comparison") {
+                        stage15Model.runComparisonExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage15Model.isRunning)
+                }
+
+                Section("Stage 15 Log") {
+                    if stage15Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "lock.shield",
+                            description: Text("Run the mutex and actor experiments, then compare the API shape, the suspension points, and the final count.")
+                        )
+                    } else {
+                        ForEach(stage15Model.events) { event in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(event.message)
                                     .font(.body)
@@ -3192,6 +3240,233 @@ private final class Stage14LabModel {
 
         events.append(event)
         print("[Stage 14] \(message) — \(context)")
+    }
+}
+
+// MARK: - Stage 15 Model Types
+
+private struct Stage15WorkerOutcome: Sendable {
+    let worker: String
+    let lastObservedValue: Int
+}
+
+private struct Stage15CounterResult: Sendable {
+    let label: String
+    let expectedCount: Int
+    let finalCount: Int
+    let lastWorker: String
+    let elapsedMilliseconds: Int
+    let isolationNote: String
+    let workerOutcomes: [Stage15WorkerOutcome]
+
+    var completionOrderSummary: String {
+        workerOutcomes.map { "\($0.worker)→\($0.lastObservedValue)" }.joined(separator: ", ")
+    }
+
+    var summary: String {
+        "\(label) finished with \(finalCount)/\(expectedCount) increments in \(elapsedMilliseconds)ms"
+    }
+}
+
+private struct Stage15CounterState {
+    var total = 0
+    var lastWorker = "none"
+}
+
+private final class Stage15MutexCounter: Sendable {
+    nonisolated let storage = Mutex(Stage15CounterState())
+
+    nonisolated init() {}
+
+    nonisolated func increment(worker: String) -> Int {
+        storage.withLock { state in
+            state.total += 1
+            state.lastWorker = worker
+            return state.total
+        }
+    }
+
+    nonisolated func snapshot() -> (count: Int, lastWorker: String) {
+        storage.withLock { state in
+            (state.total, state.lastWorker)
+        }
+    }
+}
+
+private actor Stage15ActorCounter {
+    private var total = 0
+    private var lastWorker = "none"
+
+    func increment(worker: String) -> Int {
+        total += 1
+        lastWorker = worker
+        return total
+    }
+
+    func snapshot() -> (count: Int, lastWorker: String) {
+        (total, lastWorker)
+    }
+}
+
+private func stage15RunMutexCounterWorkload() async -> Stage15CounterResult {
+    let counter = Stage15MutexCounter()
+
+    return await stage15RunCounterWorkload(
+        label: "Mutex",
+        increment: { worker in counter.increment(worker: worker) },
+        snapshot: { counter.snapshot() },
+        isolationNote: "synchronous critical section protected by Mutex"
+    )
+}
+
+private func stage15RunActorCounterWorkload() async -> Stage15CounterResult {
+    let counter = Stage15ActorCounter()
+
+    return await stage15RunCounterWorkload(
+        label: "Actor",
+        increment: { worker in await counter.increment(worker: worker) },
+        snapshot: { await counter.snapshot() },
+        isolationNote: "actor-isolated state with suspension-aware API"
+    )
+}
+
+private func stage15RunCounterWorkload(
+    label: String,
+    workers: Int = 4,
+    incrementsPerWorker: Int = 250,
+    increment: @Sendable @escaping (String) async -> Int,
+    snapshot: @Sendable @escaping () async -> (count: Int, lastWorker: String),
+    isolationNote: String
+) async -> Stage15CounterResult {
+    let startDate = Date()
+    let expectedCount = workers * incrementsPerWorker
+
+    let workerOutcomes: [Stage15WorkerOutcome] = await withTaskGroup(of: Stage15WorkerOutcome.self) { group in
+        for workerIndex in 1...workers {
+            group.addTask {
+                let worker = "\(label)-worker-\(workerIndex)"
+                var lastObservedValue = 0
+
+                for _ in 0..<incrementsPerWorker {
+                    lastObservedValue = await increment(worker)
+                }
+
+                return Stage15WorkerOutcome(worker: worker, lastObservedValue: lastObservedValue)
+            }
+        }
+
+        var collected: [Stage15WorkerOutcome] = []
+        for await outcome in group {
+            collected.append(outcome)
+        }
+        return collected
+    }
+
+    let state = await snapshot()
+    let elapsedMilliseconds = max(1, Int(Date().timeIntervalSince(startDate) * 1000))
+
+    return Stage15CounterResult(
+        label: label,
+        expectedCount: expectedCount,
+        finalCount: state.count,
+        lastWorker: state.lastWorker,
+        elapsedMilliseconds: elapsedMilliseconds,
+        isolationNote: isolationNote,
+        workerOutcomes: workerOutcomes
+    )
+}
+
+// MARK: - Stage 15 Lab Model
+
+@MainActor
+@Observable
+private final class Stage15LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private var experimentTask: Task<Void, Never>?
+
+    func runMutexCounterExperiment() {
+        startExperiment {
+            self.record("Mutex counter experiment started")
+            self.record("Concept: Mutex protects a tiny synchronous critical section without an actor hop")
+            self.record("Prediction: will multiple concurrent workers still finish with the exact expected count?")
+            self.record("")
+
+            let result = await stage15RunMutexCounterWorkload()
+
+            self.record(result.summary)
+            self.record("Expected count: \(result.expectedCount)")
+            self.record("Worker completion order: \(result.completionOrderSummary)")
+            self.record("Snapshot: last worker = \(result.lastWorker)")
+            self.record("Isolation note: \(result.isolationNote)")
+            self.record("Takeaway: use Mutex for small, synchronous shared state that must be updated from multiple tasks")
+        }
+    }
+
+    func runActorCounterExperiment() {
+        startExperiment {
+            self.record("Actor counter experiment started")
+            self.record("Concept: actor isolation protects the same state, but every mutation becomes an async hop")
+            self.record("Prediction: will the actor-backed counter reach the same final value as the mutex-backed one?")
+            self.record("")
+
+            let result = await stage15RunActorCounterWorkload()
+
+            self.record(result.summary)
+            self.record("Worker completion order: \(result.completionOrderSummary)")
+            self.record("Snapshot: last worker = \(result.lastWorker)")
+            self.record("Isolation note: \(result.isolationNote)")
+            self.record("Takeaway: use actors when the state naturally needs asynchronous access or richer isolation semantics")
+        }
+    }
+
+    func runComparisonExperiment() {
+        startExperiment {
+            self.record("Stage 15 comparison started")
+            self.record("We will run the same counter workload twice: once behind Mutex, once behind an actor")
+            self.record("Watch for the API difference: sync increments inside withLock versus awaited actor calls")
+            self.record("")
+
+            let mutexResult = await stage15RunMutexCounterWorkload()
+
+            self.record("Mutex result: \(mutexResult.summary)")
+            self.record("Mutex completion order: \(mutexResult.completionOrderSummary)")
+            self.record("")
+
+            let actorResult = await stage15RunActorCounterWorkload()
+
+            self.record("Actor result: \(actorResult.summary)")
+            self.record("Actor completion order: \(actorResult.completionOrderSummary)")
+            self.record("")
+            self.record("Comparison: both designs keep the count correct, but they expose different concurrency boundaries")
+            self.record("Use Mutex for small synchronous critical sections; use actors when the protected state needs an async API or may grow to include suspension")
+        }
+    }
+
+    private func startExperiment(_ operation: @escaping @MainActor () async -> Void) {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            await operation()
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 15] \(message) — \(context)")
     }
 }
 
