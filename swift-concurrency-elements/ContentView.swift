@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var stage13Model = Stage13LabModel()
     @State private var stage14Model = Stage14LabModel()
     @State private var stage15Model = Stage15LabModel()
+    @State private var stage16Model = Stage16LabModel()
 
     var body: some View {
         NavigationStack {
@@ -703,6 +704,66 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 16 — MainActor and UI Architecture") {
+                    Text("UI isolation and executor hops")
+                        .font(.headline)
+
+                    Text("Compare @MainActor isolation, MainActor.run, and Task { @MainActor in ... }. Then move decode work out of UI isolation.")
+
+                    Button(stage16Model.isRunning ? "Running..." : "Run MainActor Update Forms") {
+                        stage16Model.runMainActorUpdateFormsExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage16Model.isRunning)
+
+                    Button(stage16Model.isRunning ? "Running..." : "Run Task Context Inheritance") {
+                        stage16Model.runTaskContextExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage16Model.isRunning)
+
+                    Button(stage16Model.isRunning ? "Running..." : "Run Off-Main Decode Experiment") {
+                        stage16Model.runOffMainDecodeExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage16Model.isRunning)
+                }
+
+                Section("Stage 16 UI Snapshot") {
+                    Text("Status: \(stage16Model.statusMessage)")
+
+                    if stage16Model.gallery.isEmpty {
+                        Text("No decoded images yet")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(stage16Model.gallery) { image in
+                            Text(image.summary)
+                                .font(.caption)
+                        }
+                    }
+                }
+
+                Section("Stage 16 Log") {
+                    if stage16Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "photo.stack",
+                            description: Text("Run each Stage 16 experiment and inspect when UI state mutates directly, when an explicit MainActor hop is needed, and where decode work executes.")
+                        )
+                    } else {
+                        ForEach(stage16Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -886,6 +947,24 @@ private struct Stage12GallerySnapshot: Sendable {
 
     var summary: String {
         "\(title): selected \(selectedTitle), \(itemCount) items"
+    }
+}
+
+private struct Stage16DecodePayload: Sendable {
+    let id: Int
+    let name: String
+    let pixelCount: Int
+    let seed: Int
+}
+
+private struct Stage16DecodedImage: Identifiable, Sendable {
+    let id: Int
+    let name: String
+    let checksum: Int
+    let yieldedDuringTransform: Bool
+
+    var summary: String {
+        "\(name): checksum \(checksum), yielded: \(yieldedDuringTransform)"
     }
 }
 
@@ -1408,6 +1487,27 @@ private nonisolated(nonsending) func stage9CallerContextProbe(label: String) asy
     )
 }
 
+@concurrent private nonisolated func stage16DecodeAndTransform(_ payload: Stage16DecodePayload) async -> Stage16DecodedImage {
+    var checksum = payload.seed
+    var yieldedDuringTransform = false
+
+    for index in 0..<payload.pixelCount {
+        checksum = (checksum &* 37 &+ index &+ payload.id) % 1_000_003
+
+        if index > 0, index.isMultiple(of: 90_000) {
+            yieldedDuringTransform = true
+            await Task.yield()
+        }
+    }
+
+    return Stage16DecodedImage(
+        id: payload.id,
+        name: payload.name,
+        checksum: checksum,
+        yieldedDuringTransform: yieldedDuringTransform
+    )
+}
+
 private nonisolated func stage11RunSplitAwaitSequence(
     on database: Stage11Database,
     owner: String,
@@ -1614,7 +1714,8 @@ private final class Stage12LabModel {
 
     private func record(_ message: String) {
         let timestamp = Date().formatted(date: .omitted, time: .standard)
-        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let threadNote = Thread.isMainThread ? "main" : "not main"
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(threadNote)"
         let event = LabEvent(message: message, context: context)
 
         events.append(event)
@@ -3467,6 +3568,139 @@ private final class Stage15LabModel {
 
         events.append(event)
         print("[Stage 15] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage16LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+    private(set) var statusMessage = "Idle"
+    private(set) var gallery: [Stage16DecodedImage] = []
+
+    private var experimentTask: Task<Void, Never>?
+
+    func runMainActorUpdateFormsExperiment() {
+        startExperiment {
+            self.record("MainActor update forms experiment started")
+            self.record("Prediction: which update requires an explicit hop back to MainActor?")
+
+            self.statusMessage = "1/3 direct @MainActor mutation"
+            self.record("Updated UI state directly inside @MainActor-isolated method")
+
+            await Task { @MainActor in
+                self.statusMessage = "2/3 Task { @MainActor in } mutation"
+                self.record("Task { @MainActor in } runs in UI isolation explicitly")
+            }.value
+
+            let fetchedLabel = await self.stage16FetchStatusLabel()
+
+            await MainActor.run {
+                self.statusMessage = fetchedLabel
+                self.record("3/3 MainActor.run applied data returned by nonisolated async work")
+            }
+
+            self.record("Takeaway: @MainActor type isolation keeps UI mutation explicit and centralized")
+        }
+    }
+
+    func runTaskContextExperiment() {
+        startExperiment {
+            self.record("Task context experiment started")
+            self.record("Prediction: does Task { } inherit MainActor isolation from this @MainActor caller?")
+
+            let inheritedTask = Task {
+                self.statusMessage = "Inherited task updated UI"
+                self.record("Task { } inherited MainActor isolation from the caller")
+            }
+
+            let detachedSummary = await Task.detached(priority: .utility) { () -> String in
+                try? await Task.sleep(for: .milliseconds(250))
+
+                let hopNote = await MainActor.run {
+                    "detached task used MainActor.run for UI-bound code"
+                }
+
+                return "Task.detached does not inherit caller isolation; \(hopNote)"
+            }.value
+
+            await inheritedTask.value
+            self.statusMessage = "Detached result applied"
+            self.record(detachedSummary)
+            self.record("Takeaway: Task.detached abandons actor-context inheritance by design")
+        }
+    }
+
+    func runOffMainDecodeExperiment() {
+        startExperiment {
+            self.record("Off-main decode experiment started")
+            self.record("Prediction: can we keep expensive decode work outside UI isolation, then apply one MainActor state update?")
+
+            self.gallery = []
+            self.statusMessage = "Decoding 3 images..."
+
+            let payloads: [Stage16DecodePayload] = [
+                Stage16DecodePayload(id: 1, name: "Avatar", pixelCount: 320_000, seed: 13),
+                Stage16DecodePayload(id: 2, name: "Backdrop", pixelCount: 420_000, seed: 29),
+                Stage16DecodePayload(id: 3, name: "Thumbnail", pixelCount: 180_000, seed: 41)
+            ]
+
+            let decoded = await withTaskGroup(of: Stage16DecodedImage.self) { group in
+                for payload in payloads {
+                    group.addTask {
+                        await stage16DecodeAndTransform(payload)
+                    }
+                }
+
+                var collected: [Stage16DecodedImage] = []
+                for await image in group {
+                    collected.append(image)
+                }
+
+                return collected.sorted { $0.id < $1.id }
+            }
+
+            self.gallery = decoded
+            self.statusMessage = "Decoded \(decoded.count) images"
+
+            for image in decoded {
+                self.record("Decoded \(image.summary)")
+            }
+
+            self.record("UI state changed once after concurrent decode finished")
+            self.record("Takeaway: keep CPU-heavy transforms out of MainActor isolation whenever possible")
+        }
+    }
+
+    private nonisolated func stage16FetchStatusLabel() async -> String {
+        try? await Task.sleep(for: .milliseconds(300))
+        return "3/3 MainActor.run mutation"
+    }
+
+    private func startExperiment(_ operation: @escaping @MainActor () async -> Void) {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            await operation()
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(Thread.isMainThread ? "main" : "not main")"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 16] \(message) — \(context)")
     }
 }
 
