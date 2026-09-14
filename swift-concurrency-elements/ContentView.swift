@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var stage14Model = Stage14LabModel()
     @State private var stage15Model = Stage15LabModel()
     @State private var stage16Model = Stage16LabModel()
+    @State private var stage17Model = Stage17LabModel()
 
     var body: some View {
         NavigationStack {
@@ -764,6 +765,52 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 17 - Executors and Performance") {
+                    Text("Blocking vs suspension on executors")
+                        .font(.headline)
+
+                    Text("Compare an async function that blocks with sleep() against a suspending variant, then inspect task creation overhead and priority propagation.")
+
+                    Button(stage17Model.isRunning ? "Running..." : "Run Blocking vs Suspending") {
+                        stage17Model.runBlockingVsSuspendingExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage17Model.isRunning)
+
+                    Button(stage17Model.isRunning ? "Running..." : "Run Task Creation Overhead") {
+                        stage17Model.runTaskCreationOverheadExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage17Model.isRunning)
+
+                    Button(stage17Model.isRunning ? "Running..." : "Run Priority Inheritance Snapshot") {
+                        stage17Model.runPrioritySnapshotExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage17Model.isRunning)
+                }
+
+                Section("Stage 17 Log") {
+                    if stage17Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "speedometer",
+                            description: Text("Run the Stage 17 experiments and inspect where blocking stalls executor progress, where suspension yields it, and how task priority propagates.")
+                        )
+                    } else {
+                        ForEach(stage17Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -965,6 +1012,15 @@ private struct Stage16DecodedImage: Identifiable, Sendable {
 
     var summary: String {
         "\(name): checksum \(checksum), yielded: \(yieldedDuringTransform)"
+    }
+}
+
+private struct Stage17BenchmarkResult: Sendable {
+    let label: String
+    let elapsedMilliseconds: Int
+
+    var summary: String {
+        "\(label): \(elapsedMilliseconds)ms"
     }
 }
 
@@ -1506,6 +1562,53 @@ private nonisolated(nonsending) func stage9CallerContextProbe(label: String) asy
         checksum: checksum,
         yieldedDuringTransform: yieldedDuringTransform
     )
+}
+
+@MainActor
+private func stage17BadAsyncFunction() async {
+    // Intentionally blocks the MainActor executor despite being async.
+    sleep(2)
+}
+
+@MainActor
+private func stage17GoodAsyncFunction() async {
+    try? await Task.sleep(for: .seconds(2))
+}
+
+private nonisolated func stage17RunInlineWork(iterations: Int) async -> Stage17BenchmarkResult {
+    let start = Date()
+    var accumulator = 0
+
+    for value in 0..<iterations {
+        accumulator &+= value
+    }
+
+    _ = accumulator
+    let elapsedMilliseconds = max(1, Int(Date().timeIntervalSince(start) * 1000))
+    return Stage17BenchmarkResult(label: "inline loop (\(iterations) ops)", elapsedMilliseconds: elapsedMilliseconds)
+}
+
+private nonisolated func stage17RunTaskGroupWork(iterations: Int) async -> Stage17BenchmarkResult {
+    let start = Date()
+
+    let accumulator = await withTaskGroup(of: Int.self) { group in
+        for value in 0..<iterations {
+            group.addTask {
+                value
+            }
+        }
+
+        var sum = 0
+        for await value in group {
+            sum &+= value
+        }
+
+        return sum
+    }
+
+    _ = accumulator
+    let elapsedMilliseconds = max(1, Int(Date().timeIntervalSince(start) * 1000))
+    return Stage17BenchmarkResult(label: "task group (\(iterations) child tasks)", elapsedMilliseconds: elapsedMilliseconds)
 }
 
 private nonisolated func stage11RunSplitAwaitSequence(
@@ -3701,6 +3804,131 @@ private final class Stage16LabModel {
 
         events.append(event)
         print("[Stage 16] \(message) — \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage17LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+
+    private var experimentTask: Task<Void, Never>?
+
+    func runBlockingVsSuspendingExperiment() {
+        startExperiment {
+            self.record("Blocking vs suspending experiment started")
+            self.record("Prediction: will heartbeat logs continue while stage17BadAsyncFunction() is running?")
+
+            let blockedHeartbeat = Task {
+                for tick in 1...6 {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    self.record("heartbeat during blocking run: \(tick)")
+                }
+            }
+
+            self.record("Starting bad async function (sleep(2)) on MainActor")
+            await stage17BadAsyncFunction()
+            self.record("Bad async function returned")
+
+            await blockedHeartbeat.value
+            self.record("If most heartbeats appeared after the bad call returns, MainActor executor was blocked")
+            self.record("")
+
+            let suspendingHeartbeat = Task {
+                for tick in 1...6 {
+                    try? await Task.sleep(for: .milliseconds(300))
+                    self.record("heartbeat during suspending run: \(tick)")
+                }
+            }
+
+            self.record("Starting good async function (Task.sleep) on MainActor")
+            await stage17GoodAsyncFunction()
+            self.record("Good async function returned")
+
+            await suspendingHeartbeat.value
+            self.record("Heartbeats should interleave with the suspending call because the task yielded the executor")
+            self.record("Takeaway: async does not guarantee non-blocking behavior")
+        }
+    }
+
+    func runTaskCreationOverheadExperiment() {
+        startExperiment {
+            self.record("Task creation overhead experiment started")
+            self.record("Prediction: for tiny operations, will spawning many child tasks be slower than one inline loop?")
+
+            let iterations = 4_000
+
+            let inline = await stage17RunInlineWork(iterations: iterations)
+            self.record(inline.summary)
+
+            let grouped = await stage17RunTaskGroupWork(iterations: iterations)
+            self.record(grouped.summary)
+
+            let delta = grouped.elapsedMilliseconds - inline.elapsedMilliseconds
+            self.record("Delta (task-group - inline): \(delta)ms")
+            self.record("Takeaway: task creation has overhead; use concurrency where the work per task is meaningful")
+        }
+    }
+
+    func runPrioritySnapshotExperiment() {
+        startExperiment {
+            self.record("Priority snapshot experiment started")
+            self.record("Prediction: does Task { } inherit parent priority, and does Task.detached keep it?")
+
+            let parent = Task(priority: .userInitiated) {
+                let parentPriority = Task.currentPriority
+
+                let child = Task {
+                    "child Task { } priority: \(Task.currentPriority)"
+                }
+
+                let detached = Task.detached(priority: .background) {
+                    "detached priority: \(Task.currentPriority)"
+                }
+
+                let childSummary = await child.value
+                let detachedSummary = await detached.value
+
+                return (
+                    "parent priority: \(parentPriority)",
+                    childSummary,
+                    detachedSummary
+                )
+            }
+
+            let snapshot = await parent.value
+            self.record(snapshot.0)
+            self.record(snapshot.1)
+            self.record(snapshot.2)
+            self.record("Takeaway: priority is a scheduling hint; inheritance behavior differs between Task { } and Task.detached")
+        }
+    }
+
+    private func startExperiment(_ operation: @escaping @MainActor () async -> Void) {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            await operation()
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let threadNote = Thread.isMainThread ? "main" : "not main"
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(threadNote)"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 17] \(message) - \(context)")
     }
 }
 
