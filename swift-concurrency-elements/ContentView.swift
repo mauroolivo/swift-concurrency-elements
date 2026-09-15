@@ -20,6 +20,7 @@ struct ContentView: View {
     @State private var stage15Model = Stage15LabModel()
     @State private var stage16Model = Stage16LabModel()
     @State private var stage17Model = Stage17LabModel()
+    @State private var stage18Model = Stage18LabModel()
 
     var body: some View {
         NavigationStack {
@@ -811,6 +812,64 @@ struct ContentView: View {
                         }
                     }
                 }
+
+                Section("Stage 18 — Final ConcurrentImagePipeline") {
+                    Text("End-to-end pipeline composition")
+                        .font(.headline)
+
+                    Text("Run a production-style slice: deduplicated in-flight work, actor cache, bounded prefetch, cancellation, and MainActor UI integration.")
+
+                    Button(stage18Model.isRunning ? "Running..." : "Run Final Pipeline Load") {
+                        stage18Model.runFinalPipelineLoadExperiment()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(stage18Model.isRunning)
+
+                    Button(stage18Model.isRunning ? "Running..." : "Run Bounded Prefetch") {
+                        stage18Model.runBoundedPrefetchExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage18Model.isRunning)
+
+                    Button("Cancel Stage 18 Experiment") {
+                        stage18Model.cancelExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!stage18Model.isRunning)
+                }
+
+                Section("Stage 18 Gallery Snapshot") {
+                    if stage18Model.gallery.isEmpty {
+                        Text("No pipeline results yet")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(stage18Model.gallery) { image in
+                            Text(image.summary)
+                                .font(.caption)
+                        }
+                    }
+                }
+
+                Section("Stage 18 Log") {
+                    if stage18Model.events.isEmpty {
+                        ContentUnavailableView(
+                            "No events yet",
+                            systemImage: "photo.badge.checkmark",
+                            description: Text("Run the final pipeline experiment, then compare duplicate-request behavior and bounded prefetch concurrency.")
+                        )
+                    } else {
+                        ForEach(stage18Model.events) { event in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(event.message)
+                                    .font(.body)
+
+                                Text(event.context)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
             }
             .navigationTitle("Concurrency Lab")
         }
@@ -1021,6 +1080,50 @@ private struct Stage17BenchmarkResult: Sendable {
 
     var summary: String {
         "\(label): \(elapsedMilliseconds)ms"
+    }
+}
+
+private struct Stage18NetworkPayload: Sendable {
+    let url: URL
+    let byteCount: Int
+    let seed: Int
+}
+
+private struct Stage18DecodedImage: Identifiable, Sendable {
+    let url: URL
+    let byteCount: Int
+    let checksum: Int
+
+    var id: URL { url }
+
+    var summary: String {
+        "\(url.lastPathComponent): \(byteCount) bytes, checksum \(checksum)"
+    }
+}
+
+private enum Stage18FetchSource: Sendable {
+    case cacheHit
+    case newWork
+    case sharedInFlight
+    case failed(String)
+}
+
+private struct Stage18PipelineFetch: Sendable {
+    let url: URL
+    let source: Stage18FetchSource
+    let image: Stage18DecodedImage?
+
+    var summary: String {
+        switch source {
+        case .cacheHit:
+            return "\(url.lastPathComponent): cache hit"
+        case .newWork:
+            return "\(url.lastPathComponent): new underlying pipeline work"
+        case .sharedInFlight:
+            return "\(url.lastPathComponent): shared in-flight pipeline work"
+        case .failed(let reason):
+            return "\(url.lastPathComponent): failed (\(reason))"
+        }
     }
 }
 
@@ -1609,6 +1712,224 @@ private nonisolated func stage17RunTaskGroupWork(iterations: Int) async -> Stage
     _ = accumulator
     let elapsedMilliseconds = max(1, Int(Date().timeIntervalSince(start) * 1000))
     return Stage17BenchmarkResult(label: "task group (\(iterations) child tasks)", elapsedMilliseconds: elapsedMilliseconds)
+}
+
+private nonisolated func stage18StableHash(_ input: String) -> Int {
+    input.utf8.reduce(0) { partial, byte in
+        ((partial &* 16_777_619) ^ Int(byte)) & 0x7FFF_FFFF
+    }
+}
+
+@concurrent private nonisolated func stage18DecodeAndTransform(_ payload: Stage18NetworkPayload) async -> Stage18DecodedImage {
+    var checksum = payload.seed
+
+    for index in 0..<payload.byteCount {
+        checksum = (checksum &* 33 &+ index &+ payload.seed) % 1_000_003
+
+        if index > 0, index.isMultiple(of: 120_000) {
+            await Task.yield()
+        }
+    }
+
+    return Stage18DecodedImage(
+        url: payload.url,
+        byteCount: payload.byteCount,
+        checksum: checksum
+    )
+}
+
+private actor Stage18ImageCache {
+    private var storage: [URL: Stage18DecodedImage] = [:]
+
+    func image(for url: URL) -> Stage18DecodedImage? {
+        storage[url]
+    }
+
+    func insert(_ image: Stage18DecodedImage, for url: URL) {
+        storage[url] = image
+    }
+
+    func removeAll() {
+        storage.removeAll()
+    }
+}
+
+private actor Stage18NetworkLoader {
+    private var inFlightRequests = 0
+    private var maxInFlightRequests = 0
+    private var totalRequests = 0
+
+    func loadPayload(for url: URL) async throws -> Stage18NetworkPayload {
+        try Task.checkCancellation()
+
+        inFlightRequests += 1
+        totalRequests += 1
+        maxInFlightRequests = max(maxInFlightRequests, inFlightRequests)
+
+        defer { inFlightRequests -= 1 }
+
+        let hash = stage18StableHash(url.absoluteString)
+        let delayMilliseconds = 220 + (hash % 4) * 120
+
+        try await Task.sleep(for: .milliseconds(delayMilliseconds))
+        try Task.checkCancellation()
+
+        return Stage18NetworkPayload(
+            url: url,
+            byteCount: 48_000 + (hash % 8) * 5_000,
+            seed: 13 + (hash % 97)
+        )
+    }
+
+    func metrics() -> (totalRequests: Int, maxInFlightRequests: Int) {
+        (totalRequests, maxInFlightRequests)
+    }
+
+    func resetMetrics() {
+        inFlightRequests = 0
+        maxInFlightRequests = 0
+        totalRequests = 0
+    }
+}
+
+private actor Stage18DownloadCoordinator {
+    private enum Entry {
+        case inProgress(Task<Stage18DecodedImage, Error>)
+        case ready(Stage18DecodedImage)
+    }
+
+    struct Counters: Sendable {
+        let newWorkStarts: Int
+        let sharedInFlightHits: Int
+    }
+
+    private var entries: [URL: Entry] = [:]
+    private var newWorkStarts = 0
+    private var sharedInFlightHits = 0
+
+    private let cache: Stage18ImageCache
+    private let loader: Stage18NetworkLoader
+
+    init(cache: Stage18ImageCache, loader: Stage18NetworkLoader) {
+        self.cache = cache
+        self.loader = loader
+    }
+
+    func image(for url: URL) async throws -> Stage18PipelineFetch {
+        if let cached = await cache.image(for: url) {
+            return Stage18PipelineFetch(url: url, source: .cacheHit, image: cached)
+        }
+
+        if let entry = entries[url] {
+            switch entry {
+            case .ready(let image):
+                return Stage18PipelineFetch(url: url, source: .cacheHit, image: image)
+            case .inProgress(let task):
+                sharedInFlightHits += 1
+                let image = try await task.value
+                return Stage18PipelineFetch(url: url, source: .sharedInFlight, image: image)
+            }
+        }
+
+        let task = Task { [cache, loader] in
+            let payload = try await loader.loadPayload(for: url)
+            let decoded = await stage18DecodeAndTransform(payload)
+            await cache.insert(decoded, for: url)
+            return decoded
+        }
+
+        entries[url] = .inProgress(task)
+        newWorkStarts += 1
+
+        do {
+            let image = try await task.value
+            entries[url] = .ready(image)
+            return Stage18PipelineFetch(url: url, source: .newWork, image: image)
+        } catch {
+            entries[url] = nil
+            throw error
+        }
+    }
+
+    func counters() -> Counters {
+        Counters(newWorkStarts: newWorkStarts, sharedInFlightHits: sharedInFlightHits)
+    }
+
+    func reset() {
+        entries.removeAll()
+        newWorkStarts = 0
+        sharedInFlightHits = 0
+    }
+}
+
+private nonisolated struct Stage18ImagePipeline: Sendable {
+    private let cache: Stage18ImageCache
+    private let loader: Stage18NetworkLoader
+    private let coordinator: Stage18DownloadCoordinator
+
+    init(
+        cache: Stage18ImageCache = Stage18ImageCache(),
+        loader: Stage18NetworkLoader = Stage18NetworkLoader()
+    ) {
+        self.cache = cache
+        self.loader = loader
+        coordinator = Stage18DownloadCoordinator(cache: cache, loader: loader)
+    }
+
+    func loadImage(from url: URL) async -> Stage18PipelineFetch {
+        do {
+            return try await coordinator.image(for: url)
+        } catch {
+            return Stage18PipelineFetch(url: url, source: .failed(String(describing: error)), image: nil)
+        }
+    }
+
+    func loadBatchBounded(_ urls: [URL], maxConcurrent: Int) async -> [Stage18PipelineFetch] {
+        let limit = max(1, maxConcurrent)
+        var iterator = urls.enumerated().makeIterator()
+
+        return await withTaskGroup(of: (Int, Stage18PipelineFetch).self) { group in
+            var orderedResults = Array<Stage18PipelineFetch?>(repeating: nil, count: urls.count)
+
+            for _ in 0..<limit {
+                guard let (index, url) = iterator.next() else { break }
+
+                group.addTask {
+                    (index, await loadImage(from: url))
+                }
+            }
+
+            while let (completedIndex, fetch) = await group.next() {
+                orderedResults[completedIndex] = fetch
+
+                if let (nextIndex, nextURL) = iterator.next() {
+                    group.addTask {
+                        (nextIndex, await loadImage(from: nextURL))
+                    }
+                }
+            }
+
+            return orderedResults.compactMap { $0 }
+        }
+    }
+
+    func reset() async {
+        await cache.removeAll()
+        await coordinator.reset()
+        await loader.resetMetrics()
+    }
+
+    func metrics() async -> (newWorkStarts: Int, sharedInFlightHits: Int, networkRequests: Int, maxInFlightNetworkRequests: Int) {
+        let counters = await coordinator.counters()
+        let network = await loader.metrics()
+
+        return (
+            newWorkStarts: counters.newWorkStarts,
+            sharedInFlightHits: counters.sharedInFlightHits,
+            networkRequests: network.totalRequests,
+            maxInFlightNetworkRequests: network.maxInFlightRequests
+        )
+    }
 }
 
 private nonisolated func stage11RunSplitAwaitSequence(
@@ -3929,6 +4250,115 @@ private final class Stage17LabModel {
 
         events.append(event)
         print("[Stage 17] \(message) - \(context)")
+    }
+}
+
+@MainActor
+@Observable
+private final class Stage18LabModel {
+    private(set) var events: [LabEvent] = []
+    private(set) var isRunning = false
+    private(set) var gallery: [Stage18DecodedImage] = []
+
+    private var experimentTask: Task<Void, Never>?
+    private let pipeline = Stage18ImagePipeline()
+
+    func runFinalPipelineLoadExperiment() {
+        startExperiment {
+            await self.pipeline.reset()
+            self.gallery = []
+
+            let avatar = URL(string: "https://example.com/final/avatar.png")!
+            let hero = URL(string: "https://example.com/final/hero.png")!
+
+            self.record("Concept: one pipeline composes actor cache + in-flight dedup + loader + concurrent decode")
+            self.record("Prediction: if two requests ask for avatar.png at nearly the same time, does the second start new work or share in-flight work?")
+
+            async let first = self.pipeline.loadImage(from: avatar)
+            async let second = self.pipeline.loadImage(from: hero)
+            async let third = self.pipeline.loadImage(from: avatar)
+
+            let fetches = await [first, second, third]
+
+            self.gallery = fetches.compactMap(\.image)
+
+            for fetch in fetches {
+                self.record(fetch.summary)
+            }
+
+            let metrics = await self.pipeline.metrics()
+            self.record("Coordinator starts: \(metrics.newWorkStarts), shared in-flight hits: \(metrics.sharedInFlightHits)")
+            self.record("Network requests: \(metrics.networkRequests), max in-flight network requests: \(metrics.maxInFlightNetworkRequests)")
+            self.record("Takeaway: structured child tasks keep lifetime/cancellation bounded; actor-owned state keeps dedup and cache invariants explicit")
+        }
+    }
+    
+    @MainActor func runBoundedPrefetchExperiment() {
+        startExperiment {
+            await self.pipeline.reset()
+            self.gallery = []
+
+            let urls = [
+                URL(string: "https://example.com/final/avatar.png")!,
+                URL(string: "https://example.com/final/hero.png")!,
+                URL(string: "https://example.com/final/badge.png")!,
+                URL(string: "https://example.com/final/backdrop.png")!,
+                URL(string: "https://example.com/final/avatar.png")!,
+                URL(string: "https://example.com/final/hero.png")!
+            ]
+
+            self.record("Concept: prefetch a dynamic list with bounded concurrency instead of spawning unbounded child work")
+            self.record("Prediction: with maxConcurrent = 2, should max in-flight network requests exceed 2?")
+
+            let start = Date()
+            let fetches = await self.pipeline.loadBatchBounded(urls, maxConcurrent: 2)
+            let elapsed = Date().timeIntervalSince(start)
+
+            self.gallery = fetches.compactMap(\.image)
+
+            for fetch in fetches {
+                self.record("loadBatchBounded -> \(fetch.summary)")
+            }
+
+            let metrics = await self.pipeline.metrics()
+            self.record("Prefetch finished in \(elapsed.formatted(.number.precision(.fractionLength(2))))s")
+            self.record("Coordinator starts: \(metrics.newWorkStarts), shared in-flight hits: \(metrics.sharedInFlightHits)")
+            self.record("Network requests: \(metrics.networkRequests), max in-flight network requests: \(metrics.maxInFlightNetworkRequests)")
+            self.record("Takeaway: bounded task submission controls pressure while still allowing overlap")
+        }
+    }
+
+    func cancelExperiment() {
+        guard let experimentTask else { return }
+
+        record("Cancel requested for Stage 18 task")
+        experimentTask.cancel()
+    }
+
+    private func startExperiment(_ operation: @escaping @MainActor () async -> Void) {
+        guard experimentTask == nil else { return }
+
+        events.removeAll()
+        isRunning = true
+
+        experimentTask = Task {
+            defer {
+                isRunning = false
+                experimentTask = nil
+            }
+
+            await operation()
+        }
+    }
+
+    private func record(_ message: String) {
+        let timestamp = Date().formatted(date: .omitted, time: .standard)
+        let threadNote = Thread.isMainThread ? "main" : "not main"
+        let context = "time: \(timestamp) · isolation: MainActor · thread diagnostic: \(threadNote)"
+        let event = LabEvent(message: message, context: context)
+
+        events.append(event)
+        print("[Stage 18] \(message) - \(context)")
     }
 }
 
