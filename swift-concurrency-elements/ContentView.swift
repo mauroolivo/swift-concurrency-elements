@@ -831,6 +831,18 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                     .disabled(stage18Model.isRunning)
 
+                    Button(stage18Model.isRunning ? "Running..." : "Run Failure + Retry Eviction") {
+                        stage18Model.runFailureAndRetryEvictionExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage18Model.isRunning)
+
+                    Button(stage18Model.isRunning ? "Running..." : "Run Cancellation Under Dedup") {
+                        stage18Model.runCancellationUnderDedupExperiment()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(stage18Model.isRunning)
+
                     Button("Cancel Stage 18 Experiment") {
                         stage18Model.cancelExperiment()
                     }
@@ -1106,6 +1118,17 @@ private enum Stage18FetchSource: Sendable {
     case newWork
     case sharedInFlight
     case failed(String)
+}
+
+private enum Stage18PipelineError: Error, Sendable, CustomStringConvertible {
+    case transientFailure(url: URL)
+
+    var description: String {
+        switch self {
+        case .transientFailure(let url):
+            return "transientFailure(\(url.lastPathComponent))"
+        }
+    }
 }
 
 private struct Stage18PipelineFetch: Sendable {
@@ -1758,9 +1781,16 @@ private actor Stage18NetworkLoader {
     private var inFlightRequests = 0
     private var maxInFlightRequests = 0
     private var totalRequests = 0
+    private var transientFailuresConsumed: Set<String> = []
 
     func loadPayload(for url: URL) async throws -> Stage18NetworkPayload {
         try Task.checkCancellation()
+
+        let key = url.absoluteString
+        if key.contains("fail-once"), !transientFailuresConsumed.contains(key) {
+            transientFailuresConsumed.insert(key)
+            throw Stage18PipelineError.transientFailure(url: url)
+        }
 
         inFlightRequests += 1
         totalRequests += 1
@@ -1769,7 +1799,12 @@ private actor Stage18NetworkLoader {
         defer { inFlightRequests -= 1 }
 
         let hash = stage18StableHash(url.absoluteString)
-        let delayMilliseconds = 220 + (hash % 4) * 120
+        let delayMilliseconds: Int
+        if key.contains("slow") {
+            delayMilliseconds = 1_600
+        } else {
+            delayMilliseconds = 220 + (hash % 4) * 120
+        }
 
         try await Task.sleep(for: .milliseconds(delayMilliseconds))
         try Task.checkCancellation()
@@ -1789,6 +1824,7 @@ private actor Stage18NetworkLoader {
         inFlightRequests = 0
         maxInFlightRequests = 0
         totalRequests = 0
+        transientFailuresConsumed.removeAll()
     }
 }
 
@@ -1824,27 +1860,48 @@ private actor Stage18DownloadCoordinator {
             switch entry {
             case .ready(let image):
                 return Stage18PipelineFetch(url: url, source: .cacheHit, image: image)
-            case .inProgress(let task):
+            case .inProgress(let sharedTask):
                 sharedInFlightHits += 1
-                let image = try await task.value
-                return Stage18PipelineFetch(url: url, source: .sharedInFlight, image: image)
+
+                do {
+                    let image = try await sharedTask.value
+                    entries[url] = .ready(image)
+                    return Stage18PipelineFetch(url: url, source: .sharedInFlight, image: image)
+                } catch is CancellationError {
+                    // Note: this checks the shared in-flight coordinator task, not the outer caller task.
+                    if sharedTask.isCancelled {
+                        entries[url] = nil
+                    }
+
+                    throw CancellationError()
+                } catch {
+                    entries[url] = nil
+                    throw error
+                }
             }
         }
 
-        let task = Task { [cache, loader] in
+        let sharedTask = Task { [cache, loader] in
             let payload = try await loader.loadPayload(for: url)
             let decoded = await stage18DecodeAndTransform(payload)
             await cache.insert(decoded, for: url)
             return decoded
         }
 
-        entries[url] = .inProgress(task)
+        entries[url] = .inProgress(sharedTask)
         newWorkStarts += 1
 
         do {
-            let image = try await task.value
+            let image = try await sharedTask.value
             entries[url] = .ready(image)
             return Stage18PipelineFetch(url: url, source: .newWork, image: image)
+        } catch is CancellationError {
+            // Note: this checks the shared in-flight coordinator task, not the outer caller task.
+            if sharedTask.isCancelled {
+                entries[url] = nil
+            }
+
+            throw CancellationError()
         } catch {
             entries[url] = nil
             throw error
@@ -4292,8 +4349,8 @@ private final class Stage18LabModel {
             self.record("Takeaway: structured child tasks keep lifetime/cancellation bounded; actor-owned state keeps dedup and cache invariants explicit")
         }
     }
-    
-    @MainActor func runBoundedPrefetchExperiment() {
+    @MainActor
+    func runBoundedPrefetchExperiment() {
         startExperiment {
             await self.pipeline.reset()
             self.gallery = []
@@ -4325,6 +4382,74 @@ private final class Stage18LabModel {
             self.record("Coordinator starts: \(metrics.newWorkStarts), shared in-flight hits: \(metrics.sharedInFlightHits)")
             self.record("Network requests: \(metrics.networkRequests), max in-flight network requests: \(metrics.maxInFlightNetworkRequests)")
             self.record("Takeaway: bounded task submission controls pressure while still allowing overlap")
+        }
+    }
+
+    @MainActor
+    func runFailureAndRetryEvictionExperiment() {
+        startExperiment {
+            await self.pipeline.reset()
+            self.gallery = []
+
+            let transientURL = URL(string: "https://example.com/final/fail-once-avatar.png")!
+
+            self.record("Concept: failures should propagate to all waiters and failed in-flight entries must be evicted")
+            self.record("Prediction: if two callers share one failing in-flight task, do both fail, and does a later retry succeed?")
+
+            async let first = self.pipeline.loadImage(from: transientURL)
+            async let second = self.pipeline.loadImage(from: transientURL)
+
+            let firstRound = await [first, second]
+
+            for fetch in firstRound {
+                self.record("round 1 -> \(fetch.summary)")
+            }
+
+            let metricsAfterFirstRound = await self.pipeline.metrics()
+            self.record("After round 1 - starts: \(metricsAfterFirstRound.newWorkStarts), shared hits: \(metricsAfterFirstRound.sharedInFlightHits), network requests: \(metricsAfterFirstRound.networkRequests)")
+
+            let retry = await self.pipeline.loadImage(from: transientURL)
+            self.record("round 2 retry -> \(retry.summary)")
+
+            self.gallery = [retry].compactMap(\.image)
+
+            let metricsAfterRetry = await self.pipeline.metrics()
+            self.record("After retry - starts: \(metricsAfterRetry.newWorkStarts), shared hits: \(metricsAfterRetry.sharedInFlightHits), network requests: \(metricsAfterRetry.networkRequests)")
+            self.record("Takeaway: eviction on underlying failure keeps dedup state healthy for retries")
+        }
+    }
+
+    @MainActor
+    func runCancellationUnderDedupExperiment() {
+        startExperiment {
+            await self.pipeline.reset()
+            self.gallery = []
+
+            let slowURL = URL(string: "https://example.com/final/slow-hero.png")!
+
+            self.record("Concept: cancellation of one waiter is not the same as failure of shared in-flight work")
+            self.record("Prediction: if caller A starts work, caller B joins in-flight, then A cancels, should B still complete?")
+
+            let callerA = Task { await self.pipeline.loadImage(from: slowURL) }
+            try? await Task.sleep(for: .milliseconds(60))
+
+            let callerB = Task { await self.pipeline.loadImage(from: slowURL) }
+            try? await Task.sleep(for: .milliseconds(150))
+
+            callerA.cancel()
+            self.record("Cancelled caller A while shared in-flight work remained active")
+
+            let resultA = await callerA.value
+            let resultB = await callerB.value
+
+            self.record("caller A -> \(resultA.summary)")
+            self.record("caller B -> \(resultB.summary)")
+
+            self.gallery = [resultA, resultB].compactMap(\.image)
+
+            let metrics = await self.pipeline.metrics()
+            self.record("Metrics - starts: \(metrics.newWorkStarts), shared hits: \(metrics.sharedInFlightHits), network requests: \(metrics.networkRequests)")
+            self.record("Takeaway: cancelled waiters should not automatically tear down shared pipeline work")
         }
     }
 
